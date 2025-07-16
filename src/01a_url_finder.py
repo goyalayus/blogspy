@@ -135,16 +135,17 @@ def main():
 
     corporate_seeds = []
     try:
-        # --- THE DEFINITIVE FIX ---
-        # Read the single-column CSV without a header, then select the column by its integer index (0) to get a Series.
-        df_corp_domains = pd.read_csv(
+        # The corporate file now contains full URLs, so we read them directly.
+        df_corp_urls = pd.read_csv(
             CORPORATE_DOMAINS_FILE, header=None, nrows=num_samples)
-        # Select the first (and only) column
-        domain_series = df_corp_domains[0]
 
-        for domain in domain_series.dropna().unique():
-            corporate_seeds.append({'url': f"https://{domain.strip()}",
-                                   'max_links': 10, 'label': LABEL_MAPPING['corporate_seo']})
+        # Select the first (and only) column which now contains full URLs
+        url_series = df_corp_urls[0]
+
+        for url in url_series.dropna().unique():
+            # --- MODIFICATION: Increased max_links to 50 ---
+            corporate_seeds.append({'url': url.strip(),
+                                   'max_links': 50, 'label': LABEL_MAPPING['corporate_seo']})
     except Exception as e:
         logger.error(
             f"Could not load corporate file '{CORPORATE_DOMAINS_FILE}': {e}")
@@ -153,8 +154,9 @@ def main():
     try:
         df_pers = pd.read_csv(PERSONAL_BLOGS_FILE, nrows=num_samples)
         for url in df_pers['Site URL'].dropna().unique():
+            # --- MODIFICATION: Increased max_links to 50 ---
             personal_seeds.append(
-                {'url': url.strip(), 'max_links': 6, 'label': LABEL_MAPPING['personal_blog']})
+                {'url': url.strip(), 'max_links': 50, 'label': LABEL_MAPPING['personal_blog']})
     except Exception as e:
         logger.error(
             f"Could not load personal sites file '{PERSONAL_BLOGS_FILE}': {e}")
