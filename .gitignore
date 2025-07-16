@@ -1,0 +1,30 @@
+
+# Byte-compiled / optimized / C extensions
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environment
+venv/
+.venv/
+
+# Project-specific generated files
+
+
+# IDE / Editor specific
+.idea/
+.vscode/
+data/processed/temp_enriched_data.jsonl
+
+outputs/
+# Ignore everything in data/
+data/*
+
+# …but keep the raw sub-folder
+!data/raw/
+!data/raw/**
+
+
+digest.txt
+src/digest.txt
+

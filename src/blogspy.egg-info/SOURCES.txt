@@ -1,0 +1,6 @@
+README.md
+pyproject.toml
+src/blogspy.egg-info/PKG-INFO
+src/blogspy.egg-info/SOURCES.txt
+src/blogspy.egg-info/dependency_links.txt
+src/blogspy.egg-info/top_level.txt
