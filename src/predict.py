@@ -1,5 +1,3 @@
-# src/predict.py
-
 from src.utils import get_logger
 from src.config import MODELS_DIR, ID_TO_LABEL, REQUEST_TIMEOUT, REQUEST_HEADERS
 from src.feature_engineering import extract_url_features, extract_structural_features, extract_content_features
@@ -14,19 +12,14 @@ import warnings
 import scipy.sparse as sp
 import numpy as np
 
-# --- Path and Logger Setup ---
 project_root = pathlib.Path(__file__).parent.parent
 sys.path.append(str(project_root))
 logger = get_logger(__name__)
-
-# --- START OF DEBUG MODIFICATION ---
-
 
 def print_debug_info(vector_name: str, features, num_to_print=20):
     """Prints detailed debug information for a feature vector."""
     is_sparse = hasattr(features, "toarray")
     if is_sparse:
-        # Convert sparse matrix to a dense numpy array
         features_dense = features.toarray().flatten()
     else:
         features_dense = np.array(features).flatten()
@@ -36,7 +29,6 @@ def print_debug_info(vector_name: str, features, num_to_print=20):
     print(f"Sum: {np.sum(features_dense):.6f}")
     print(f"Non-zero count: {np.count_nonzero(features_dense)}")
 
-    # For L2-normalized vectors, the sum of squares should be 1.0
     if is_sparse and "HashingVectorizer" in vector_name:
         print(
             f"Sum of Squares (L2 Norm Check): {np.sum(features_dense**2):.6f}")
@@ -48,10 +40,6 @@ def print_debug_info(vector_name: str, features, num_to_print=20):
         val = features_dense[idx]
         print(f"  Index: {idx:<5}, Value: {val:.6f}")
     print(f"-----------------------------------")
-
-
-# --- END OF DEBUG MODIFICATION ---
-
 
 def fetch_and_parse(url: str) -> dict | None:
     """ Fetches and parses a URL, returning a dictionary of contents. """
@@ -117,16 +105,13 @@ def main():
                 vectorizer = artifact['vectorizer']
                 model = artifact['model']
 
-                # --- START OF DEBUG MODIFICATION ---
                 df = pd.DataFrame([site_data])
 
-                # 1. Get and print text features
                 txt_features = vectorizer.transform(
                     df["text_content"].fillna(""))
                 print_debug_info(
                     "Text Features (HashingVectorizer)", txt_features)
 
-                # 2. Get and print other engineered features
                 url_features = extract_url_features(
                     df["url"]).to_numpy(dtype="float32")
                 structural_features = extract_structural_features(
@@ -138,21 +123,19 @@ def main():
                 print_debug_info("Structural Features", structural_features)
                 print_debug_info("Content Features", content_features)
 
-                # 3. Combine them for the final prediction
                 features = sp.hstack([
                     txt_features,
                     sp.csr_matrix(url_features),
                     sp.csr_matrix(structural_features),
                     sp.csr_matrix(content_features)
                 ], format="csr")
-                # --- END OF DEBUG MODIFICATION ---
 
                 probabilities = model.predict(features)
                 prediction_id = (probabilities > 0.5).astype(int)[0]
                 confidence = probabilities[0] if prediction_id == 1 else 1 - \
                     probabilities[0]
 
-            else:  # content_only and url_only models are full sklearn pipelines
+            else:
                 pipeline = artifact
                 predict_input = [site_data['url']] if args.model == 'url_only' else [
                     site_data['text_content']]

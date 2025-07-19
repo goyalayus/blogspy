@@ -36,7 +36,6 @@ from src.config import (
 )
 from src.utils import get_logger
 
-# ────────── logging helpers ─────────────────────────────────────
 logger = get_logger(__name__)
 
 
@@ -49,15 +48,13 @@ def log(msg: str, t0: float | None = None):
     logger.info(f"{msg:<60} | mem={rss_mb():8.2f} MB {dt}")
 
 
-# ────────── constants ───────────────────────────────────────────
 URL_LIST_FILE = PROCESSED_DATA_DIR / "urls_to_fetch.csv"
 BATCH_SIZE = 500
-DELAY_BETWEEN_BATCHES = 0.05            # seconds
-MAX_INFLIGHT = MAX_WORKERS * 4  # cap pending futures
-HARD_DEADLINE = 45              # wall-clock seconds / url
-COMPRESS_HTML = False           # turn on if you want it
+DELAY_BETWEEN_BATCHES = 0.05
+MAX_INFLIGHT = MAX_WORKERS * 4
+HARD_DEADLINE = 45
+COMPRESS_HTML = False
 
-# ────────── fast, light parser set-up ───────────────────────────
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 PARSER_FILTER = SoupStrainer(text=True)
 
@@ -69,7 +66,6 @@ def extract_text(html: str) -> str:
     return txt
 
 
-# ────────── thread-local session (keeps conns alive) ────────────
 _local = {}
 
 
@@ -80,9 +76,6 @@ def sess() -> requests.Session:
         s.headers.update(REQUEST_HEADERS)
         _local["session"] = s
     return s
-
-# ────────── worker function ─────────────────────────────────────
-
 
 def fetch(url: str, label: int) -> dict:
     out = {"url": url, "label": label,
@@ -99,9 +92,6 @@ def fetch(url: str, label: int) -> dict:
     except Exception as e:
         logger.warning(f"Failed {url}: {e}")
     return out
-
-# ────────── utilities to resume work ────────────────────────────
-
 
 def seen_urls() -> set[str]:
     done = set()
@@ -128,9 +118,6 @@ def url_stream() -> Iterator[List[Dict]]:
                 buf = []
         if buf:
             yield buf
-
-# ────────── parquet writer (unchanged logic) ────────────────────
-
 
 def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path, chunk=1000):
     log("JSONL → Parquet conversion start")
@@ -161,9 +148,6 @@ def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path, chunk=1000):
         writer.close()
     log("Conversion finished")
 
-# ────────── main ────────────────────────────────────────────────
-
-
 def main() -> None:
     t_global = time.time()
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
@@ -178,11 +162,10 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool, \
             open(TEMP_JSONL_FILE, "a", encoding="utf-8") as fh:
 
-        inflight = set()        # type: set[concurrent.futures.Future]
+        inflight = set()
         try:
             for batch_no, urls in enumerate(url_stream(), 1):
                 t_batch = time.time()
-                # enqueue work
                 for item in urls:
                     while len(inflight) >= MAX_INFLIGHT:
                         done, inflight = wait(
@@ -192,7 +175,6 @@ def main() -> None:
                     inflight.add(pool.submit(
                         fetch, item["url"], item["label"]))
 
-                # wait for the rest of the batch but with HARD_DEADLINE
                 deadline = time.time() + HARD_DEADLINE
                 while inflight:
                     timeout = max(0, deadline - time.time())
@@ -203,7 +185,6 @@ def main() -> None:
                     for fut in done:
                         handle_future(fut, fh)
 
-                # cancel anything that over-ran the hard deadline
                 for fut in list(inflight):
                     if not fut.done():
                         fut.cancel()
@@ -224,7 +205,6 @@ def main() -> None:
             pool.shutdown(wait=False, cancel_futures=True)
             raise
 
-    # ── convert & tidy up ────────────────────────────────────────
     if ENRICHED_DATA_FILE.exists():
         ENRICHED_DATA_FILE.unlink()
     jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE)
@@ -233,9 +213,6 @@ def main() -> None:
     log(f"Parquet rows = {len(pd.read_parquet(ENRICHED_DATA_FILE))}")
     TEMP_JSONL_FILE.unlink(missing_ok=True)
     log("─ Done ─", t_global)
-
-# ---------- helper to write & discard ----------------------------------------
-
 
 def handle_future(fut, fh):
     try:
@@ -247,7 +224,5 @@ def handle_future(fut, fh):
     except Exception as e:
         logger.error(f"Worker raised: {e}")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
