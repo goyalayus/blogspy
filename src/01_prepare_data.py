@@ -19,7 +19,11 @@ import time
 import warnings
 import zlib
 from concurrent.futures import (
-    ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED, CancelledError
+    ThreadPoolExecutor,
+    wait,
+    FIRST_COMPLETED,
+    ALL_COMPLETED,
+    CancelledError,
 )
 from typing import Dict, List, Iterator
 
@@ -31,8 +35,12 @@ from bs4 import BeautifulSoup, SoupStrainer, XMLParsedAsHTMLWarning
 from tqdm import tqdm
 
 from src.config import (
-    ENRICHED_DATA_FILE, MAX_WORKERS, PROCESSED_DATA_DIR,
-    REQUEST_HEADERS, REQUEST_TIMEOUT, TEMP_JSONL_FILE
+    ENRICHED_DATA_FILE,
+    MAX_WORKERS,
+    PROCESSED_DATA_DIR,
+    REQUEST_HEADERS,
+    REQUEST_TIMEOUT,
+    TEMP_JSONL_FILE,
 )
 from src.utils import get_logger
 
@@ -56,7 +64,7 @@ HARD_DEADLINE = 45
 COMPRESS_HTML = False
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-PARSER_FILTER = SoupStrainer(text=True)
+PARSER_FILTER = SoupStrainer(string=True)
 
 
 def extract_text(html: str) -> str:
@@ -77,9 +85,9 @@ def sess() -> requests.Session:
         _local["session"] = s
     return s
 
+
 def fetch(url: str, label: int) -> dict:
-    out = {"url": url, "label": label,
-           "html_content": None, "text_content": None}
+    out = {"url": url, "label": label, "html_content": None, "text_content": None}
     try:
         r = sess().get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -92,6 +100,7 @@ def fetch(url: str, label: int) -> dict:
     except Exception as e:
         logger.warning(f"Failed {url}: {e}")
     return out
+
 
 def seen_urls() -> set[str]:
     done = set()
@@ -119,15 +128,17 @@ def url_stream() -> Iterator[List[Dict]]:
         if buf:
             yield buf
 
+
 def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path, chunk=1000):
     log("JSONL → Parquet conversion start")
-    schema = pa.schema([
-        pa.field("url", pa.string()),
-        pa.field("label", pa.int64()),
-        pa.field("html_content",
-                 pa.binary() if COMPRESS_HTML else pa.string()),
-        pa.field("text_content", pa.string()),
-    ])
+    schema = pa.schema(
+        [
+            pa.field("url", pa.string()),
+            pa.field("label", pa.int64()),
+            pa.field("html_content", pa.binary() if COMPRESS_HTML else pa.string()),
+            pa.field("text_content", pa.string()),
+        ]
+    )
     writer, rows = None, []
     with open(src, encoding="utf-8") as f:
         for ln in tqdm(f, desc="Convert"):
@@ -148,6 +159,7 @@ def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path, chunk=1000):
         writer.close()
     log("Conversion finished")
 
+
 def main() -> None:
     t_global = time.time()
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
@@ -156,11 +168,12 @@ def main() -> None:
         logger.error("URL list missing – run 01a_url_finder.py first")
         return
 
-    if (n := len(seen_urls())):
+    if n := len(seen_urls()):
         logger.info(f"Resuming – {n} URLs already processed")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool, \
-            open(TEMP_JSONL_FILE, "a", encoding="utf-8") as fh:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool, open(
+        TEMP_JSONL_FILE, "a", encoding="utf-8"
+    ) as fh:
 
         inflight = set()
         try:
@@ -168,20 +181,19 @@ def main() -> None:
                 t_batch = time.time()
                 for item in urls:
                     while len(inflight) >= MAX_INFLIGHT:
-                        done, inflight = wait(
-                            inflight, return_when=FIRST_COMPLETED)
+                        done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
                         for fut in done:
                             handle_future(fut, fh)
-                    inflight.add(pool.submit(
-                        fetch, item["url"], item["label"]))
+                    inflight.add(pool.submit(fetch, item["url"], item["label"]))
 
                 deadline = time.time() + HARD_DEADLINE
                 while inflight:
                     timeout = max(0, deadline - time.time())
                     if timeout == 0:
                         break
-                    done, inflight = wait(inflight, timeout=timeout,
-                                          return_when=FIRST_COMPLETED)
+                    done, inflight = wait(
+                        inflight, timeout=timeout, return_when=FIRST_COMPLETED
+                    )
                     for fut in done:
                         handle_future(fut, fh)
 
@@ -198,8 +210,7 @@ def main() -> None:
                 time.sleep(DELAY_BETWEEN_BATCHES)
 
         except KeyboardInterrupt:
-            logger.warning(
-                "Interrupted by user ‑ cancelling outstanding tasks…")
+            logger.warning("Interrupted by user ‑ cancelling outstanding tasks…")
             for fut in inflight:
                 fut.cancel()
             pool.shutdown(wait=False, cancel_futures=True)
@@ -210,19 +221,32 @@ def main() -> None:
     jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE)
 
     import pandas as pd
+
     log(f"Parquet rows = {len(pd.read_parquet(ENRICHED_DATA_FILE))}")
     TEMP_JSONL_FILE.unlink(missing_ok=True)
     log("─ Done ─", t_global)
+
 
 def handle_future(fut, fh):
     try:
         res = fut.result()
         fh.write(json.dumps(res, ensure_ascii=False) + "\n")
     except CancelledError:
-        fh.write(json.dumps({"url": None, "label": -1,
-                             "html_content": None, "text_content": None})+"\n")
+        fh.write(
+            json.dumps(
+                {
+                    "url": None,
+                    "label": -1,
+                    "html_content": None,
+                    "text_content": None,
+                }
+            )
+            + "\n"
+        )
     except Exception as e:
         logger.error(f"Worker raised: {e}")
 
+
 if __name__ == "__main__":
     main()
+
