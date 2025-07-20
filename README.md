@@ -1,7 +1,3 @@
-Of course. Here are the concise, step-by-step instructions for setting up the environment and training the model, formatted for your `README.md` file.
-
----
-
 # BlogSpy: Training Pipeline
 
 This guide provides the exact steps to set up the environment and run the full training pipeline from scratch.
@@ -11,7 +7,7 @@ This guide provides the exact steps to set up the environment and run the full t
 First, create a virtual environment and install the required Python packages.
 
 ```bash
-# From the project's root directory (goyalayus-blogspy/)
+# From the project's root directory (blogspy)
 
 # Create the virtual environment
 python3 -m venv .venv

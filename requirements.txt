@@ -1,16 +1,10 @@
-
-# Core Data Science & ML
 pandas
 scikit-learn
 lightgbm
 joblib
-
-# Data Fetching & Parsing
 requests
 beautifulsoup4
 tqdm
 pyarrow
-
-# Reporting & Visualization
 matplotlib
 psutil
