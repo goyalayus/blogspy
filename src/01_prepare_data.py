@@ -1,10 +1,11 @@
 """
-01_prepare_data.py   –  robust, low-RAM, timeout-hardened version
+01_prepare_data.py   –  High-throughput structured text extraction
 ──────────────────────────────────────────────────────────────────
-• At most MAX_WORKERS×4 futures alive (prevents RAM spikes)
-• Per-future hard deadline (DNS + connect + read)   -> no stalls
-• Graceful Ctrl-C  (--> executor.shutdown(cancel_futures=True))
-• Optional gzip compression of the html_content column
+• Extracts text from specific HTML tags (p, h1, li, etc.)
+• Stores data in a structured format: [{'tag': 'h1', 'text': '...'}, ...]
+• Uses a targeted parser for extreme efficiency (only parses relevant tags)
+• Per-future hard deadline and graceful shutdown for robustness
+• Creates a highly-optimized Parquet file with a nested schema
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import pathlib
 import re
 import time
 import warnings
-import zlib
 from concurrent.futures import (
     CancelledError,
     FIRST_COMPLETED,
@@ -26,7 +26,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from threading import local
-from typing import Dict, Iterator, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import psutil
 import pyarrow as pa
@@ -50,15 +50,28 @@ logger = get_logger(__name__)
 URL_LIST_FILE = PROCESSED_DATA_DIR / "urls_to_fetch.csv"
 MAX_INFLIGHT = MAX_WORKERS * 4
 HARD_DEADLINE_SECONDS = 45
-COMPRESS_HTML = False
 LOG_SUCCESS = True
 
+TARGET_TAGS = (
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "li",
+    "blockquote",
+    "pre",
+    "article",
+)
+
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-PARSER_FILTER = SoupStrainer(string=True)
 _thread_local = local()
 
 try:
     import lxml
+
     PARSER = "lxml"
 except ImportError:
     PARSER = "html.parser"
@@ -100,36 +113,42 @@ def get_session() -> requests.Session:
     return _thread_local.session
 
 
-def extract_text(html: str) -> str:
-    soup = BeautifulSoup(html, PARSER, parse_only=PARSER_FILTER)
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+def extract_structured_text(html: str) -> List[Dict[str, str]]:
+    strainer = SoupStrainer(TARGET_TAGS)
+    soup = BeautifulSoup(html, PARSER, parse_only=strainer)
+    content = []
+
+    for tag in soup.find_all(TARGET_TAGS):
+        text = re.sub(r"\s+", " ", tag.get_text(strip=True)).strip()
+        if text:
+            content.append({"tag": tag.name, "text": text})
+
     soup.decompose()
-    return text
+    return content
 
 
-def fetch(url: str, label: int, compress: bool) -> dict:
+def fetch(url: str, label: int) -> dict:
     out = {
         "url": url,
         "label": label,
-        "html_content": None,
-        "text_content": None,
+        "structured_text": None,
         "status": "failed",
     }
     try:
         session = get_session()
         response = session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        html = response.text
-        out["text_content"] = extract_text(html)
 
-        if compress:
-            out["html_content"] = zlib.compress(html.encode("utf-8"))
+        extracted_content = extract_structured_text(response.text)
+        if extracted_content:
+            out["structured_text"] = extracted_content
+            out["status"] = "success"
+            if LOG_SUCCESS:
+                logger.info(
+                    f"Success: {url} ({len(extracted_content)} text blocks)")
         else:
-            out["html_content"] = html
-
-        out["status"] = "success"
-        if LOG_SUCCESS:
-            logger.info(f"Success: {url}")
+            out["status"] = "success_empty"
+            logger.info(f"Success (empty): No target text found in {url}")
 
     except requests.exceptions.RequestException as e:
         logger.warning(f"Failed {url}: {type(e).__name__}")
@@ -149,7 +168,8 @@ def get_seen_urls() -> set[str]:
         for line in f:
             try:
                 record = json.loads(line)
-                if record.get("status") == "success" and record.get("url"):
+                if record.get("status",
+                              "").startswith("success") and record.get("url"):
                     done.add(record["url"])
             except (json.JSONDecodeError, KeyError):
                 continue
@@ -167,19 +187,20 @@ def generate_urls_to_fetch() -> Iterator[Dict]:
                 yield {"url": row["url"], "label": int(row["label"])}
 
 
-def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path,
-                     compress_html: bool):
+def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path):
     log("JSONL → Parquet conversion start")
     schema = pa.schema([
         pa.field("url", pa.string()),
         pa.field("label", pa.int64()),
-        pa.field("html_content",
-                 pa.binary() if compress_html else pa.string()),
-        pa.field("text_content", pa.string()),
+        pa.field(
+            "structured_text",
+            pa.list_(
+                pa.struct([
+                    pa.field("tag", pa.string()),
+                    pa.field("text", pa.string())
+                ])),
+        ),
     ])
-
-    rows_to_write = []
-    writer = None
 
     def read_chunks():
         with open(src, "r", encoding="utf-8") as f:
@@ -192,10 +213,14 @@ def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path,
                 except json.JSONDecodeError:
                     continue
 
+    writer = None
+    rows_to_write = []
+    chunk_size = 1000
+
     with tqdm(desc="Converting to Parquet", unit=" rows") as pbar:
         for record in read_chunks():
             rows_to_write.append(record)
-            if len(rows_to_write) >= 1000:
+            if len(rows_to_write) >= chunk_size:
                 table = pa.Table.from_pylist(rows_to_write, schema=schema)
                 if writer is None:
                     writer = pq.ParquetWriter(dst,
@@ -222,11 +247,10 @@ def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path,
 def main() -> None:
     t_global = time.time()
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
-    log("─ Start Data Fetch ─")
+    log("─ Start Structured Text Extraction ─")
 
     if not URL_LIST_FILE.exists():
-        logger.error(
-            f"URL list missing: {URL_LIST_FILE} – run dependent script first.")
+        logger.error(f"URL list missing: {URL_LIST_FILE}")
         return
 
     stats = Stats()
@@ -235,11 +259,10 @@ def main() -> None:
     stats.skipped = len(get_seen_urls())
 
     if not urls_to_process:
-        log("All URLs have already been processed. Nothing to do.")
+        log("All URLs have already been processed.")
         if TEMP_JSONL_FILE.exists():
             log("Finalizing Parquet file from existing temp data.")
-            jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE,
-                             COMPRESS_HTML)
+            jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE)
         log("─ Done ─", t_global)
         return
 
@@ -259,7 +282,7 @@ def main() -> None:
                     try:
                         item = next(url_iterator)
                         future = executor.submit(fetch, item["url"],
-                                                 item["label"], COMPRESS_HTML)
+                                                 item["label"])
                         inflight[future] = (item["url"], time.time())
                     except StopIteration:
                         break
@@ -276,7 +299,8 @@ def main() -> None:
                         result = future.result()
                         f_out.write(
                             json.dumps(result, ensure_ascii=False) + "\n")
-                        if result.get("status") == "success":
+                        status = result.get("status", "failed")
+                        if status.startswith("success"):
                             stats.success += 1
                         else:
                             stats.failed += 1
@@ -309,7 +333,7 @@ def main() -> None:
     if TEMP_JSONL_FILE.exists():
         if ENRICHED_DATA_FILE.exists():
             ENRICHED_DATA_FILE.unlink()
-        jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE, COMPRESS_HTML)
+        jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE)
         TEMP_JSONL_FILE.unlink()
 
     log("─ All Done ─", t_global)
