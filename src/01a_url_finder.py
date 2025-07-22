@@ -153,7 +153,7 @@ def main():
             corporate_seeds.append(
                 {
                     "url": url.strip(),
-                    "max_links": 50,
+                    "max_links": 25,
                     "label": LABEL_MAPPING["corporate_seo"],
                 }
             )
@@ -167,7 +167,7 @@ def main():
             personal_seeds.append(
                 {
                     "url": url.strip(),
-                    "max_links": 50,
+                    "max_links": 25,
                     "label": LABEL_MAPPING["personal_blog"],
                 }
             )
