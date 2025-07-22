@@ -29,7 +29,6 @@ from urllib.parse import urlparse, urljoin
 from collections import deque
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 import csv
 import argparse
 import threading
@@ -47,17 +46,17 @@ HEAD_TIMEOUT = 5
 
 
 def fetch_and_parse_page(url: str) -> tuple[str, set[str]]:
-    """
-    GET a page, return a tuple (original_url, set_of_internal_absolute_links).
-    Any error => returns (url, empty_set).
-    """
+    logger.debug("Fetching page: %s", url)
     try:
         resp = requests.get(url,
                             timeout=REQUEST_TIMEOUT,
                             headers=REQUEST_HEADERS)
         resp.raise_for_status()
 
-        if "text/html" not in resp.headers.get("Content-Type", ""):
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            logger.debug("Skipping non-HTML content (%s) at %s", content_type,
+                         url)
             return url, set()
 
         warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -70,18 +69,20 @@ def fetch_and_parse_page(url: str) -> tuple[str, set[str]]:
                 continue
             abs_url = urljoin(url, href).split("#")[0]
             links.add(abs_url)
+
+        logger.debug("Successfully parsed %s, found %d links.", url,
+                     len(links))
         return url, links
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.warning("Request for %s failed: %s", url, e)
         return url, set()
     except Exception as e:
-        logger.warning("Unexpected error processing %s: %s", url, e)
+        logger.error("An unexpected parsing error occurred for %s: %s", url, e)
         return url, set()
 
 
 def is_url_alive(url: str) -> bool:
-    """
-    Lightweight HEAD probe to see if the seed URL is reachable (status < 400).
-    """
+    logger.debug("Probing URL: %s", url)
     try:
         resp = requests.head(
             url,
@@ -89,16 +90,18 @@ def is_url_alive(url: str) -> bool:
             headers=REQUEST_HEADERS,
             allow_redirects=True,
         )
-        return resp.status_code < 400
-    except requests.RequestException:
+        if resp.status_code < 400:
+            logger.debug("URL %s is alive (status: %d)", url, resp.status_code)
+            return True
+        else:
+            logger.debug("URL %s is dead (status: %d)", url, resp.status_code)
+            return False
+    except requests.RequestException as e:
+        logger.debug("URL %s probe failed: %s", url, e)
         return False
 
 
 class CrawlManager:
-    """
-    Keeps per-domain state and enforces the ≤ max_links quota.
-    This class is thread-safe.
-    """
 
     def __init__(self, writer: csv.writer, written_urls_set: set[str]):
         self.writer = writer
@@ -107,34 +110,26 @@ class CrawlManager:
         self.tasks_by_domain: dict[str, dict] = {}
 
     def add_seed_task(self, url: str, label: int, max_links: int):
-        """
-        Register a new domain. Returns the seed url if accepted, else None.
-        """
         with self.lock:
             domain = urlparse(url).netloc.replace("www.", "")
-            if not domain or domain in self.tasks_by_domain:
+            if not domain:
+                logger.warning("Skipping seed with invalid domain: %s", url)
+                return None
+            if domain in self.tasks_by_domain:
+                logger.debug("Skipping duplicate seed domain: %s", domain)
                 return None
 
-            self.tasks_by_domain[domain] = dict(
-                label=label,
-                max=max_links,
-                queue=deque([url]),
-                visited={url},
-                count=0,
-            )
+            self.tasks_by_domain[domain] = dict(label=label,
+                                                max=max_links,
+                                                queue=deque([url]),
+                                                visited={url},
+                                                count=0)
+            logger.debug("Registered new domain '%s' with max_links=%d",
+                         domain, max_links)
             return url
 
-    def process_result(
-        self,
-        original_url: str,
-        found_links: set[str],
-    ) -> tuple[list[str], bool]:
-        """
-        1. Prepares the finished page for writing (if not yet written).
-        2. Queues up to the remaining quota of *same-domain* links.
-        3. Performs the actual file write *outside* the lock.
-        Returns (new_urls_to_submit, wrote_new_page_bool).
-        """
+    def process_result(self, original_url: str,
+                       found_links: set[str]) -> tuple[list[str], bool]:
         new_urls = []
         wrote_page = False
         row_to_write = None
@@ -143,20 +138,30 @@ class CrawlManager:
             domain = urlparse(original_url).netloc.replace("www.", "")
             state = self.tasks_by_domain.get(domain)
             if not state:
+                logger.debug(
+                    "No state found for domain '%s' (task likely finished)",
+                    domain)
                 return new_urls, wrote_page
+
+            logger.debug("Processing results for %s", original_url)
 
             if original_url not in self.written_urls:
                 row_to_write = [original_url, state["label"]]
                 self.written_urls.add(original_url)
                 state["count"] += 1
                 wrote_page = True
+                logger.debug("URL %s is new. Count for domain '%s' is now %d.",
+                             original_url, domain, state["count"])
 
             remaining = state["max"] - state["count"]
             if remaining <= 0:
+                logger.info("Domain '%s' reached its quota of %d pages.",
+                            domain, state["max"])
                 if row_to_write:
                     self.writer.writerow(row_to_write)
                 return new_urls, wrote_page
 
+            queued_count = 0
             for link in found_links:
                 if len(new_urls) >= remaining:
                     break
@@ -165,28 +170,28 @@ class CrawlManager:
                     if link_domain == domain and link not in state["visited"]:
                         state["visited"].add(link)
                         new_urls.append(link)
+                        queued_count += 1
                 except Exception:
                     continue
 
+            if queued_count > 0:
+                logger.debug(
+                    "Found %d new, same-domain URLs to queue from %s. Quota remaining: %d.",
+                    queued_count, original_url, remaining - queued_count)
+
         if row_to_write:
             self.writer.writerow(row_to_write)
+            logger.debug("Wrote row to file for %s", original_url)
 
         return new_urls, wrote_page
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Find and validate URLs for the dataset (≤ 25 per domain)."
-    )
-    parser.add_argument("--debug",
-                        action="store_true",
-                        help="Run in debug mode (20 seeds each).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-
-    logger.info(
-        "--- RUNNING IN %s MODE ---",
-        "DEBUG" if args.debug else "NORMAL",
-    )
+    log_level_msg = "DEBUG" if args.debug else "NORMAL"
+    logger.info("--- SCRIPT START --- RUNNING IN %s MODE ---", log_level_msg)
 
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
     if OUTPUT_FILE.exists():
@@ -194,56 +199,63 @@ def main():
         OUTPUT_FILE.unlink()
 
     sample_rows = 20 if args.debug else None
-
     corporate_seeds, personal_seeds = [], []
 
     try:
+        logger.info("Loading corporate seeds from %s", CORPORATE_DOMAINS_FILE)
         corp_df = pd.read_csv(CORPORATE_DOMAINS_FILE,
                               header=None,
                               nrows=sample_rows)
         for url in corp_df[0].dropna().unique():
             corporate_seeds.append(
-                dict(
-                    url=url.strip(),
-                    max_links=25,
-                    label=LABEL_MAPPING["corporate_seo"],
-                ))
+                dict(url=url.strip(),
+                     max_links=25,
+                     label=LABEL_MAPPING["corporate_seo"]))
+        logger.info("Found %d unique corporate seed URLs.",
+                    len(corporate_seeds))
     except Exception as exc:
         logger.error("Cannot read %s: %s", CORPORATE_DOMAINS_FILE, exc)
 
     try:
+        logger.info("Loading personal blog seeds from %s", PERSONAL_BLOGS_FILE)
         pers_df = pd.read_csv(PERSONAL_BLOGS_FILE, nrows=sample_rows)
         for url in pers_df["Site URL"].dropna().unique():
             personal_seeds.append(
-                dict(
-                    url=url.strip(),
-                    max_links=25,
-                    label=LABEL_MAPPING["personal_blog"],
-                ))
+                dict(url=url.strip(),
+                     max_links=25,
+                     label=LABEL_MAPPING["personal_blog"]))
+        logger.info("Found %d unique personal blog seed URLs.",
+                    len(personal_seeds))
     except Exception as exc:
         logger.error("Cannot read %s: %s", PERSONAL_BLOGS_FILE, exc)
 
     all_seeds = corporate_seeds + personal_seeds
-    logger.info("Validating %d seed URLs with HEAD requests...",
+    logger.info("Validating %d total seed URLs with HEAD requests...",
                 len(all_seeds))
 
     valid_tasks = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(is_url_alive, t["url"]): t for t in all_seeds}
-        for fut in tqdm(as_completed(futures),
+        future_to_task = {
+            pool.submit(is_url_alive, t["url"]): t
+            for t in all_seeds
+        }
+        for fut in tqdm(as_completed(future_to_task),
                         total=len(all_seeds),
                         desc="Validating"):
             if fut.result():
-                valid_tasks.append(futures[fut])
+                valid_tasks.append(future_to_task[fut])
 
-    logger.info("Validation complete – %d live seed sites.", len(valid_tasks))
+    logger.info("Validation complete – %d of %d URLs are live.",
+                len(valid_tasks), len(all_seeds))
     if not valid_tasks:
-        logger.error("No live seeds – aborting.")
+        logger.error("No live seeds found. Aborting.")
         return
 
     total_pages_planned = sum(t["max_links"] for t in valid_tasks)
-
+    logger.info("Total pages to crawl across all live domains: %d",
+                total_pages_planned)
     written_urls: set[str] = set()
+
     with (
             open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f_out,
             ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool,
@@ -252,38 +264,40 @@ def main():
     ):
         writer = csv.writer(f_out)
         writer.writerow(["url", "label"])
-
         manager = CrawlManager(writer, written_urls)
-        futures = {}
+
+        future_to_url = {}
 
         for task in valid_tasks:
             seed_url = manager.add_seed_task(task["url"], task["label"],
                                              task["max_links"])
             if seed_url:
-                futures[pool.submit(fetch_and_parse_page, seed_url)] = seed_url
+                future = pool.submit(fetch_and_parse_page, seed_url)
+                future_to_url[future] = seed_url
 
-        while futures:
-            done, futures = as_completed(futures), {}
-            for fut in done:
-                original = fut.owner()
+        logger.info("Submitted %d initial seed tasks to the crawl pool.",
+                    len(future_to_url))
+
+        while future_to_url:
+            for future in as_completed(future_to_url):
+                original_url = future_to_url.pop(future)
                 try:
-                    _, links = fut.result()
+                    _, links = future.result()
                 except Exception as exc:
-                    logger.error("Exception while crawling %s: %s", original,
-                                 exc)
+                    logger.error("Future for %s failed with exception: %s",
+                                 original_url, exc)
                     links = set()
 
-                new_urls, wrote = manager.process_result(original, links)
+                new_urls, wrote = manager.process_result(original_url, links)
                 if wrote:
                     pbar.update(1)
 
                 for url in new_urls:
-                    future = pool.submit(fetch_and_parse_page, url)
-                    future.owner = lambda u=url: u
-                    futures[future] = future
+                    new_future = pool.submit(fetch_and_parse_page, url)
+                    future_to_url[new_future] = url
 
     logger.info(
-        "Finished – wrote %d unique URLs to %s",
+        "--- CRAWL FINISHED --- Wrote %d unique URLs to %s",
         len(written_urls),
         OUTPUT_FILE,
     )
