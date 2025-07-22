@@ -8,29 +8,30 @@
 """
 
 from __future__ import annotations
+
 import csv
 import gc
 import json
 import os
 import pathlib
 import re
-import sys
 import time
 import warnings
 import zlib
 from concurrent.futures import (
+    CancelledError,
+    FIRST_COMPLETED,
     ThreadPoolExecutor,
     wait,
-    FIRST_COMPLETED,
-    ALL_COMPLETED,
-    CancelledError,
 )
-from typing import Dict, List, Iterator
+from dataclasses import dataclass
+from threading import local
+from typing import Dict, Iterator, Tuple
 
 import psutil
-import requests
 import pyarrow as pa
 import pyarrow.parquet as pq
+import requests
 from bs4 import BeautifulSoup, SoupStrainer, XMLParsedAsHTMLWarning
 from tqdm import tqdm
 
@@ -46,6 +47,41 @@ from src.utils import get_logger
 
 logger = get_logger(__name__)
 
+URL_LIST_FILE = PROCESSED_DATA_DIR / "urls_to_fetch.csv"
+MAX_INFLIGHT = MAX_WORKERS * 4
+HARD_DEADLINE_SECONDS = 45
+COMPRESS_HTML = False
+LOG_SUCCESS = True
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+PARSER_FILTER = SoupStrainer(string=True)
+_thread_local = local()
+
+try:
+    import lxml
+    PARSER = "lxml"
+except ImportError:
+    PARSER = "html.parser"
+    logger.warning(
+        "lxml not found, falling back to html.parser. For faster performance, run 'pip install lxml'."
+    )
+
+
+@dataclass
+class Stats:
+    success: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    skipped: int = 0
+    total: int = 0
+
+    def __str__(self):
+        return (f"Completed: {self.success} | "
+                f"Failed: {self.failed} | "
+                f"Cancelled: {self.cancelled} | "
+                f"Skipped: {self.skipped} | "
+                f"Total: {self.total}")
+
 
 def rss_mb() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
@@ -56,105 +92,128 @@ def log(msg: str, t0: float | None = None):
     logger.info(f"{msg:<60} | mem={rss_mb():8.2f} MB {dt}")
 
 
-URL_LIST_FILE = PROCESSED_DATA_DIR / "urls_to_fetch.csv"
-BATCH_SIZE = 500
-DELAY_BETWEEN_BATCHES = 0.05
-MAX_INFLIGHT = MAX_WORKERS * 4
-HARD_DEADLINE = 45
-COMPRESS_HTML = False
-
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-PARSER_FILTER = SoupStrainer(string=True)
+def get_session() -> requests.Session:
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.headers.update(REQUEST_HEADERS)
+        _thread_local.session = session
+    return _thread_local.session
 
 
 def extract_text(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml", parse_only=PARSER_FILTER)
-    txt = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    soup = BeautifulSoup(html, PARSER, parse_only=PARSER_FILTER)
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     soup.decompose()
-    return txt
+    return text
 
 
-_local = {}
-
-
-def sess() -> requests.Session:
-    s = _local.get("session")
-    if s is None:
-        s = requests.Session()
-        s.headers.update(REQUEST_HEADERS)
-        _local["session"] = s
-    return s
-
-
-def fetch(url: str, label: int) -> dict:
-    out = {"url": url, "label": label, "html_content": None, "text_content": None}
+def fetch(url: str, label: int, compress: bool) -> dict:
+    out = {
+        "url": url,
+        "label": label,
+        "html_content": None,
+        "text_content": None,
+        "status": "failed",
+    }
     try:
-        r = sess().get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        html = r.text
+        session = get_session()
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        html = response.text
         out["text_content"] = extract_text(html)
-        if COMPRESS_HTML:
+
+        if compress:
             out["html_content"] = zlib.compress(html.encode("utf-8"))
         else:
             out["html_content"] = html
+
+        out["status"] = "success"
+        if LOG_SUCCESS:
+            logger.info(f"Success: {url}")
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed {url}: {type(e).__name__}")
     except Exception as e:
-        logger.warning(f"Failed {url}: {e}")
+        logger.error(f"An unexpected error occurred for {url}: {e}",
+                     exc_info=True)
+
     return out
 
 
-def seen_urls() -> set[str]:
+def get_seen_urls() -> set[str]:
+    if not TEMP_JSONL_FILE.exists():
+        return set()
+
     done = set()
-    if TEMP_JSONL_FILE.exists():
-        with open(TEMP_JSONL_FILE, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    done.add(json.loads(line)["url"])
-                except Exception:
-                    pass
+    with open(TEMP_JSONL_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+                if record.get("status") == "success" and record.get("url"):
+                    done.add(record["url"])
+            except (json.JSONDecodeError, KeyError):
+                continue
     return done
 
 
-def url_stream() -> Iterator[List[Dict]]:
-    already = seen_urls()
-    with open(URL_LIST_FILE, encoding="utf-8") as f:
-        rdr, buf = csv.DictReader(f), []
-        for row in rdr:
-            if row["url"] in already:
-                continue
-            buf.append({"url": row["url"], "label": int(row["label"])})
-            if len(buf) == BATCH_SIZE:
-                yield buf
-                buf = []
-        if buf:
-            yield buf
+def generate_urls_to_fetch() -> Iterator[Dict]:
+    seen = get_seen_urls()
+    logger.info(f"Found {len(seen)} previously processed URLs to skip.")
+
+    with open(URL_LIST_FILE, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["url"] not in seen:
+                yield {"url": row["url"], "label": int(row["label"])}
 
 
-def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path, chunk=1000):
+def jsonl_to_parquet(src: pathlib.Path, dst: pathlib.Path,
+                     compress_html: bool):
     log("JSONL → Parquet conversion start")
-    schema = pa.schema(
-        [
-            pa.field("url", pa.string()),
-            pa.field("label", pa.int64()),
-            pa.field("html_content", pa.binary() if COMPRESS_HTML else pa.string()),
-            pa.field("text_content", pa.string()),
-        ]
-    )
-    writer, rows = None, []
-    with open(src, encoding="utf-8") as f:
-        for ln in tqdm(f, desc="Convert"):
-            try:
-                rows.append(json.loads(ln))
-            except json.JSONDecodeError:
-                continue
-            if len(rows) >= chunk:
-                tbl = pa.Table.from_pylist(rows, schema=schema)
-                writer = writer or pq.ParquetWriter(dst, tbl.schema)
-                writer.write_table(tbl)
-                rows = []
-        if rows:
-            tbl = pa.Table.from_pylist(rows, schema=schema)
-            writer = writer or pq.ParquetWriter(dst, tbl.schema)
-            writer.write_table(tbl)
+    schema = pa.schema([
+        pa.field("url", pa.string()),
+        pa.field("label", pa.int64()),
+        pa.field("html_content",
+                 pa.binary() if compress_html else pa.string()),
+        pa.field("text_content", pa.string()),
+    ])
+
+    rows_to_write = []
+    writer = None
+
+    def read_chunks():
+        with open(src, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    if record.get("status") == "success":
+                        del record["status"]
+                        yield record
+                except json.JSONDecodeError:
+                    continue
+
+    with tqdm(desc="Converting to Parquet", unit=" rows") as pbar:
+        for record in read_chunks():
+            rows_to_write.append(record)
+            if len(rows_to_write) >= 1000:
+                table = pa.Table.from_pylist(rows_to_write, schema=schema)
+                if writer is None:
+                    writer = pq.ParquetWriter(dst,
+                                              table.schema,
+                                              compression="ZSTD")
+                writer.write_table(table)
+                pbar.update(len(rows_to_write))
+                rows_to_write = []
+
+        if rows_to_write:
+            table = pa.Table.from_pylist(rows_to_write, schema=schema)
+            if writer is None:
+                writer = pq.ParquetWriter(dst,
+                                          table.schema,
+                                          compression="ZSTD")
+            writer.write_table(table)
+            pbar.update(len(rows_to_write))
+
     if writer:
         writer.close()
     log("Conversion finished")
@@ -164,89 +223,97 @@ def main() -> None:
     t_global = time.time()
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
     log("─ Start Data Fetch ─")
+
     if not URL_LIST_FILE.exists():
-        logger.error("URL list missing – run 01a_url_finder.py first")
+        logger.error(
+            f"URL list missing: {URL_LIST_FILE} – run dependent script first.")
         return
 
-    if n := len(seen_urls()):
-        logger.info(f"Resuming – {n} URLs already processed")
+    stats = Stats()
+    urls_to_process = list(generate_urls_to_fetch())
+    stats.total = len(urls_to_process)
+    stats.skipped = len(get_seen_urls())
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool, open(
-        TEMP_JSONL_FILE, "a", encoding="utf-8"
-    ) as fh:
+    if not urls_to_process:
+        log("All URLs have already been processed. Nothing to do.")
+        if TEMP_JSONL_FILE.exists():
+            log("Finalizing Parquet file from existing temp data.")
+            jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE,
+                             COMPRESS_HTML)
+        log("─ Done ─", t_global)
+        return
 
-        inflight = set()
-        try:
-            for batch_no, urls in enumerate(url_stream(), 1):
-                t_batch = time.time()
-                for item in urls:
-                    while len(inflight) >= MAX_INFLIGHT:
-                        done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
-                        for fut in done:
-                            handle_future(fut, fh)
-                    inflight.add(pool.submit(fetch, item["url"], item["label"]))
+    log(f"Starting fetch for {stats.total} URLs.")
 
-                deadline = time.time() + HARD_DEADLINE
-                while inflight:
-                    timeout = max(0, deadline - time.time())
-                    if timeout == 0:
-                        break
-                    done, inflight = wait(
-                        inflight, timeout=timeout, return_when=FIRST_COMPLETED
-                    )
-                    for fut in done:
-                        handle_future(fut, fh)
-
-                for fut in list(inflight):
-                    if not fut.done():
-                        fut.cancel()
-                        inflight.remove(fut)
-                        logger.warning("Hard-cancelled one slow url")
-
-                fh.flush()
-                os.fsync(fh.fileno())
-                gc.collect()
-                log(f"Finished batch {batch_no} ({len(urls)} urls)", t_batch)
-                time.sleep(DELAY_BETWEEN_BATCHES)
-
-        except KeyboardInterrupt:
-            logger.warning("Interrupted by user ‑ cancelling outstanding tasks…")
-            for fut in inflight:
-                fut.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-
-    if ENRICHED_DATA_FILE.exists():
-        ENRICHED_DATA_FILE.unlink()
-    jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE)
-
-    import pandas as pd
-
-    log(f"Parquet rows = {len(pd.read_parquet(ENRICHED_DATA_FILE))}")
-    TEMP_JSONL_FILE.unlink(missing_ok=True)
-    log("─ Done ─", t_global)
-
-
-def handle_future(fut, fh):
     try:
-        res = fut.result()
-        fh.write(json.dumps(res, ensure_ascii=False) + "\n")
-    except CancelledError:
-        fh.write(
-            json.dumps(
-                {
-                    "url": None,
-                    "label": -1,
-                    "html_content": None,
-                    "text_content": None,
-                }
-            )
-            + "\n"
-        )
-    except Exception as e:
-        logger.error(f"Worker raised: {e}")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor, open(
+                TEMP_JSONL_FILE, "a",
+                encoding="utf-8") as f_out, tqdm(total=stats.total,
+                                                 desc="Fetching URLs",
+                                                 unit="url") as pbar:
+            inflight: Dict[Future, Tuple[str, float]] = {}
+            url_iterator = iter(urls_to_process)
+
+            while True:
+                while len(inflight) < MAX_INFLIGHT:
+                    try:
+                        item = next(url_iterator)
+                        future = executor.submit(fetch, item["url"],
+                                                 item["label"], COMPRESS_HTML)
+                        inflight[future] = (item["url"], time.time())
+                    except StopIteration:
+                        break
+
+                if not inflight:
+                    break
+
+                done, _ = wait(inflight.keys(),
+                               timeout=1.0,
+                               return_when=FIRST_COMPLETED)
+                for future in done:
+                    url, _ = inflight.pop(future)
+                    try:
+                        result = future.result()
+                        f_out.write(
+                            json.dumps(result, ensure_ascii=False) + "\n")
+                        if result.get("status") == "success":
+                            stats.success += 1
+                        else:
+                            stats.failed += 1
+                    except CancelledError:
+                        logger.warning(f"Cancelled: {url}")
+                        stats.cancelled += 1
+                    except Exception as e:
+                        logger.error(
+                            f"Worker for {url} raised unexpected exception: {e}",
+                            exc_info=True,
+                        )
+                        stats.failed += 1
+                    pbar.update(1)
+
+                now = time.time()
+                for future, (url, submit_time) in list(inflight.items()):
+                    if now - submit_time > HARD_DEADLINE_SECONDS:
+                        future.cancel()
+                        logger.warning(
+                            f"Hard Deadline Exceeded: Cancelling {url}")
+
+                f_out.flush()
+
+    except KeyboardInterrupt:
+        logger.warning("\nInterrupted by user. Shutting down gracefully...")
+    finally:
+        log("─ Fetching complete. Finalizing data. ─")
+        log(f"Final Stats: {stats}")
+
+    if TEMP_JSONL_FILE.exists():
+        if ENRICHED_DATA_FILE.exists():
+            ENRICHED_DATA_FILE.unlink()
+        jsonl_to_parquet(TEMP_JSONL_FILE, ENRICHED_DATA_FILE, COMPRESS_HTML)
+        TEMP_JSONL_FILE.unlink()
+
+    log("─ All Done ─", t_global)
 
 
 if __name__ == "__main__":
     main()
-
