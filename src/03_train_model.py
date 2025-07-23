@@ -1,10 +1,10 @@
 """
 BlogSpy – fault-tolerant, memory-safe training pipeline
-
-Re-adds missing constants (HASH_DIM, MEM_LIMIT_GB) and allows
-re-running from the cached feature matrix to avoid rebuilding.
-
-Added logging for misclassified URLs during evaluation.
+────────────────────────────────────────────────────────
+- Builds features from the full dataset, including raw HTML for structural analysis.
+- Caches the expensive feature matrix to disk for rapid re-runs.
+- Trains a LightGBM model on the combined feature set.
+- Saves the final model and its associated vectorizer as a single artifact.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from src.config import (
 )
 from src.feature_engineering import (
     extract_content_features,
+    extract_structural_features,
     extract_url_features,
 )
 from src.utils import get_logger
@@ -124,7 +125,7 @@ class FeatureEngineer:
 
         if not self.config.enriched_data_file.exists():
             raise FileNotFoundError(
-                f"Input file not found: {self.config.enriched_data_file}. Please run the data preparation script first."
+                f"Input file not found: {self.config.enriched_data_file}. Run 01_prepare_data.py first."
             )
         return self._build_from_scratch()
 
@@ -157,28 +158,26 @@ class FeatureEngineer:
 
     def _build_from_scratch(self):
         log_memory("Building features from scratch...")
-        logger.info(
-            "Using HashingVectorizer for speed and memory efficiency. Note: this process is irreversible and sacrifices model interpretability."
-        )
         pf = pq.ParquetFile(self.config.enriched_data_file)
         X_parts, y_parts, url_parts = [], [], []
 
         for i in tqdm(range(pf.num_row_groups), desc="Processing Chunks"):
             df = (
-                pf.read_row_group(i, columns=["url", "structured_text", "label"])
+                pf.read_row_group(
+                    i, columns=["url", "structured_text", "label", "html_content"]
+                )
                 .to_pandas()
                 .dropna()
             )
             if df.empty:
                 continue
-            if i == 0:
-                self._validate_input_schema(df)
 
             df["text_content"] = df["structured_text"].apply(
-                lambda sl: " ".join(d.get("text", "") for d in sl)
-                if isinstance(sl, list)
-                else ""
+                lambda sl: " ".join(
+                    d.get("text", "") for d in sl if isinstance(sl, list)
+                )
             )
+
             X_chunk, feature_shapes = self._vectorize_chunk(df)
             if i == 0:
                 logger.info(f"Feature breakdown per instance: {feature_shapes}")
@@ -194,27 +193,20 @@ class FeatureEngineer:
         self._save_to_cache(X, y, urls)
         return X, y, urls, self.vectorizer
 
-    def _validate_input_schema(self, df: pd.DataFrame):
-        first_valid_row = df["structured_text"].iloc[0]
-        if not isinstance(first_valid_row, list):
-            raise TypeError("`structured_text` column is not a list as expected.")
-        if (
-            first_valid_row
-            and isinstance(first_valid_row[0], dict)
-            and "text" not in first_valid_row[0]
-        ):
-            raise TypeError("Dicts in `structured_text` list are missing 'text' key.")
-        logger.info("Input schema validation passed.")
-
     def _vectorize_chunk(self, df: pd.DataFrame):
         text_features = self.vectorizer.transform(df["text_content"])
         url_features = extract_url_features(df["url"]).to_numpy(dtype="float32")
+        structural_features = extract_structural_features(df["html_content"]).to_numpy(
+            dtype="float32"
+        )
         content_features = extract_content_features(df["text_content"]).to_numpy(
             dtype="float32"
         )
+
         shapes = {
             "text": text_features.shape[1],
             "url": url_features.shape[1],
+            "structural": structural_features.shape[1],
             "content": content_features.shape[1],
         }
         return (
@@ -222,6 +214,7 @@ class FeatureEngineer:
                 [
                     text_features,
                     sp.csr_matrix(url_features),
+                    sp.csr_matrix(structural_features),
                     sp.csr_matrix(content_features),
                 ],
                 format="csr",
@@ -235,9 +228,8 @@ class FeatureEngineer:
         sp.save_npz(cfg.features_file, X)
         np.save(cfg.labels_file, y)
         np.save(cfg.urls_file, urls)
-        cache_meta = {"vectorizer_hash": cfg.vectorizer_config.to_hash()}
         with open(cfg.cache_meta_file, "w") as f:
-            json.dump(cache_meta, f)
+            json.dump({"vectorizer_hash": cfg.vectorizer_config.to_hash()}, f)
         log_memory(f"Cached features {X.shape} and metadata to disk.")
 
 
@@ -257,10 +249,9 @@ class ModelTrainer:
             raise ValueError(
                 f"Training requires at least 2 classes, but found {num_classes}."
             )
-        logger.info(f"Detected {num_classes}-class classification problem.")
-
         self._log_label_distribution(y, "overall")
-        X_tr, X_te, y_tr, y_te, urls_tr, urls_te = train_test_split(
+
+        X_tr, X_te, y_tr, y_te, _, urls_te = train_test_split(
             X,
             y,
             urls,
@@ -268,112 +259,69 @@ class ModelTrainer:
             random_state=self.config.random_state,
             stratify=y,
         )
-        self._check_for_data_leakage(urls_tr, urls_te)
-        self._log_label_distribution(y_tr, "training set")
         del X, y, urls
         gc.collect()
 
-        manifest, temp_manifest_path = self._create_initial_manifest(vectorizer)
-        try:
-            booster = self._train_model(X_tr, y_tr, X_te, y_te, num_classes)
-            del X_tr, y_tr
-            gc.collect()
+        manifest, _ = self._create_initial_manifest()
+        booster = self._train_model(X_tr, y_tr, X_te, y_te, num_classes)
+        del X_tr, y_tr
+        gc.collect()
 
-            metrics, misclassified_df = self._evaluate_model(
-                booster, X_te, y_te, urls_te, num_classes
-            )
-            self._finalize_artifacts(booster, vectorizer, manifest, metrics)
-        finally:
-            if temp_manifest_path.exists():
-                temp_manifest_path.unlink()
+        metrics, _ = self._evaluate_model(booster, X_te, y_te, urls_te, num_classes)
 
-    def _check_for_data_leakage(self, urls_tr: np.ndarray, urls_te: np.ndarray):
-        leakage = set(urls_tr).intersection(urls_te)
-        if leakage:
-            logger.warning(
-                f"{len(leakage)} URLs found in both train and test sets. This indicates data leakage."
-            )
-        else:
-            logger.info("Train/test split validation passed: No URL leakage detected.")
+        final_artifact = {"model": booster, "vectorizer": vectorizer}
+        self._finalize_artifacts(final_artifact, manifest, metrics)
 
     def _log_label_distribution(self, labels: np.ndarray, name: str):
-        unique_labels, counts = np.unique(labels, return_counts=True)
+        unique, counts = np.unique(labels, return_counts=True)
         dist = {
             self.config.id_to_label.get(k, k): f"{v} ({v / len(labels):.2%})"
-            for k, v in zip(unique_labels, counts)
+            for k, v in zip(unique, counts)
         }
         logger.info(f"Label distribution in {name}: {dist}")
 
-    def _create_initial_manifest(self, vectorizer: HashingVectorizer):
-        cfg = self.config
+    def _create_initial_manifest(self) -> tuple[dict, pathlib.Path]:
         timestamp = datetime.now(timezone.utc)
-        commit_hash = get_git_commit_hash()
-        run_id = (
-            f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{commit_hash[:7]}"
-            if commit_hash
-            else timestamp.strftime("%Y%m%d_%H%M%S_%f")
-        )
-
         manifest = {
-            "run_id": run_id,
+            "run_id": f"{timestamp.strftime('%Y%m%d_%H%M%S')}_{get_git_commit_hash()[:7]}",
             "timestamp_utc": timestamp.isoformat(),
-            "git_commit_hash": commit_hash,
-            "model_params": cfg.lgbm_params,
-            "feature_params": asdict(cfg.vectorizer_config),
+            "model_params": self.config.lgbm_params,
+            "feature_params": asdict(self.config.vectorizer_config),
             "training_params": {
-                "test_size": cfg.test_size,
-                "random_state": cfg.random_state,
+                "test_size": self.config.test_size,
+                "random_state": self.config.random_state,
             },
         }
-
-        with tempfile.NamedTemporaryFile(
-            "w", delete=False, suffix=".json", encoding="utf-8"
-        ) as f:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as f:
             json.dump(manifest, f, indent=2)
-            temp_path = pathlib.Path(f.name)
-        return manifest, temp_path
+            return manifest, pathlib.Path(f.name)
 
-    def _train_model(
-        self,
-        X_tr: sp.csr_matrix,
-        y_tr: np.ndarray,
-        X_te: sp.csr_matrix,
-        y_te: np.ndarray,
-        num_classes: int,
-    ):
-        train_data = lgb.Dataset(X_tr, label=y_tr)
-        val_data = lgb.Dataset(X_te, label=y_te, reference=train_data)
+    def _train_model(self, X_tr, y_tr, X_te, y_te, num_classes):
         params = self.config.lgbm_params.copy()
         if num_classes == 2:
-            params["objective"] = "binary"
-            params["metric"] = "binary_logloss"
+            params.update({"objective": "binary", "metric": "binary_logloss"})
         else:
-            params["objective"] = "multiclass"
-            params["metric"] = "multi_logloss"
-            params["num_class"] = num_classes
+            params.update(
+                {
+                    "objective": "multiclass",
+                    "metric": "multi_logloss",
+                    "num_class": num_classes,
+                }
+            )
 
-        num_boost_round = params.pop("n_estimators")
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=25, verbose=True),
-            lgb.log_evaluation(period=50),
-        ]
+        train_data = lgb.Dataset(X_tr, label=y_tr)
+        val_data = lgb.Dataset(X_te, label=y_te, reference=train_data)
+
         return lgb.train(
             params,
             train_data,
-            num_boost_round=num_boost_round,
+            num_boost_round=params.pop("n_estimators"),
             valid_sets=[val_data],
             valid_names=["eval"],
-            callbacks=callbacks,
+            callbacks=[lgb.early_stopping(50, verbose=True), lgb.log_evaluation(100)],
         )
 
-    def _evaluate_model(
-        self,
-        booster: lgb.Booster,
-        X_te: sp.csr_matrix,
-        y_te: np.ndarray,
-        urls_te: np.ndarray,
-        num_classes: int,
-    ):
+    def _evaluate_model(self, booster, X_te, y_te, urls_te, num_classes):
         from sklearn.metrics import classification_report, ConfusionMatrixDisplay
         import matplotlib.pyplot as plt
 
@@ -384,14 +332,6 @@ class ModelTrainer:
             else (pred_probs > 0.5).astype(int)
         )
 
-        misclassified_df = self._get_sorted_misclassified(
-            y_te, preds, urls_te, pred_probs
-        )
-        if not misclassified_df.empty:
-            (self.config.reports_dir / "misclassified_urls.csv").to_csv(
-                misclassified_df, index=False
-            )
-
         report_dict = classification_report(
             y_te,
             preds,
@@ -399,10 +339,13 @@ class ModelTrainer:
             digits=4,
             output_dict=True,
         )
-        report_str = json.dumps(report_dict, indent=2)
-        print("\n--- Final Classification Report ---\n")
-        print(report_str)
-        (self.config.reports_dir / "classification_report.json").write_text(report_str)
+        logger.info(
+            "\n--- Final Classification Report ---\n"
+            + json.dumps(report_dict, indent=2)
+        )
+        (self.config.reports_dir / "classification_report.json").write_text(
+            json.dumps(report_dict, indent=2)
+        )
 
         fig, ax = plt.subplots(figsize=(8, 6))
         ConfusionMatrixDisplay.from_predictions(
@@ -416,62 +359,20 @@ class ModelTrainer:
         plt.tight_layout()
         plt.savefig(self.config.reports_dir / "confusion_matrix.png")
         plt.close(fig)
-        return report_dict, misclassified_df
 
-    def _get_sorted_misclassified(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
-        urls: np.ndarray,
-        probs: np.ndarray,
-    ):
-        misclassified_indices = np.where(y_true != y_pred)[0]
-        if len(misclassified_indices) == 0:
-            return pd.DataFrame()
+        return report_dict, None
 
-        error_df = pd.DataFrame(
-            {
-                "url": urls[misclassified_indices],
-                "true_label": y_true[misclassified_indices],
-                "predicted_label": y_pred[misclassified_indices],
-            }
-        )
-        if probs.ndim == 1:
-            error_df["confidence_wrong_pred"] = np.where(
-                y_pred[misclassified_indices] == 1,
-                probs[misclassified_indices],
-                1 - probs[misclassified_indices],
-            )
-        else:
-            error_df["confidence_wrong_pred"] = probs[
-                misclassified_indices, y_pred[misclassified_indices]
-            ]
-
-        error_df.sort_values(by="confidence_wrong_pred", ascending=False, inplace=True)
-        error_df["true_label"] = error_df["true_label"].map(self.config.id_to_label)
-        error_df["predicted_label"] = error_df["predicted_label"].map(
-            self.config.id_to_label
-        )
-        return error_df
-
-    def _finalize_artifacts(
-        self,
-        booster: lgb.Booster,
-        vectorizer: HashingVectorizer,
-        manifest: dict,
-        metrics: dict,
-    ):
+    def _finalize_artifacts(self, artifact: dict, manifest: dict, metrics: dict):
         cfg = self.config
-        model_dir = cfg.models_dir / manifest["run_id"]
-        model_dir.mkdir(parents=True, exist_ok=True)
-
-        joblib.dump(booster, model_dir / "model.joblib", compress=3)
-        joblib.dump(vectorizer, model_dir / "vectorizer.joblib", compress=3)
+        model_path = cfg.models_dir / "ayush.joblib"
+        cfg.models_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(artifact, model_path, compress=3)
 
         manifest["evaluation_metrics"] = metrics
-        with open(model_dir / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-        log_memory(f"Model artifacts and manifest saved to {model_dir}")
+        (cfg.models_dir / "ayush.manifest.json").write_text(
+            json.dumps(manifest, indent=2)
+        )
+        log_memory(f"Model artifacts and manifest saved to {cfg.models_dir}")
 
 
 def log_memory(msg: str):
@@ -499,7 +400,7 @@ if __name__ == "__main__":
         "--force",
         dest="rebuild",
         action="store_true",
-        help="Force rebuilding the feature matrix and URL cache.",
+        help="Force rebuilding the feature matrix cache.",
     )
     args = ap.parse_args()
     main(rebuild=args.rebuild)
