@@ -1,10 +1,10 @@
 """
-01_prepare_data.py   –  High-throughput structured text extraction (Chunked Parquet Edition)
-───────────────────────────────────────────────────────────────────────────────────────────
-• Extracts structured text and saves the FULL raw HTML for advanced feature engineering.
-• Bypasses large temporary text files by writing directly to compressed Parquet chunks.
-• This method is highly efficient on disk space and robust against interruptions.
-• At the end, it consolidates all temporary chunks into the final dataset.
+01_prepare_data.py   –  High-throughput structured text extraction (Production Edition)
+──────────────────────────────────────────────────────────────────────────────────────
+• Implements a robust producer-consumer pattern for smooth, observable progress.
+• Provides periodic status updates (progress %, stats, memory, rate) to the console.
+• Writes directly to compressed Parquet chunks, eliminating storage bottlenecks.
+• Fully resumable and fault-tolerant.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import pathlib
 import re
 import time
 import warnings
-from concurrent.futures import as_completed, ThreadPoolExecutor
+from concurrent.futures import as_completed, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from threading import local
 from typing import Dict, Iterator, List
@@ -40,7 +40,9 @@ from src.utils import get_logger
 logger = get_logger(__name__)
 
 URL_LIST_FILE = PROCESSED_DATA_DIR / "urls_to_fetch.csv"
-LOG_SUCCESS = True
+LOG_SUCCESS = False
+LOG_INTERVAL_SECONDS = 30
+MAX_INFLIGHT = MAX_WORKERS * 4
 
 TARGET_TAGS = (
     "p",
@@ -76,9 +78,18 @@ class Stats:
     failed: int = 0
     skipped: int = 0
     total: int = 0
+    processed_since_log: int = 0
 
-    def __str__(self):
-        return f"Completed: {self.success} | Failed: {self.failed} | Skipped: {self.skipped} | Total: {self.total}"
+    def get_progress_str(self, elapsed_time: float) -> str:
+        percent_done = (
+            (self.success + self.failed) / self.total * 100 if self.total > 0 else 0
+        )
+        rate = self.processed_since_log / elapsed_time if elapsed_time > 0 else 0
+        return (
+            f"Progress: {percent_done:5.1f}% | "
+            f"Success: {self.success}, Failed: {self.failed} | "
+            f"Rate: {rate:5.1f} url/s"
+        )
 
 
 def rss_mb() -> float:
@@ -87,7 +98,7 @@ def rss_mb() -> float:
 
 def log(msg: str, t0: float | None = None):
     dt = f"{time.time() - t0:6.2f}s" if t0 else ""
-    logger.info(f"{msg:<60} | mem={rss_mb():8.2f} MB {dt}")
+    logger.info(f"{msg:<70} | mem={rss_mb():8.2f} MB {dt}")
 
 
 def get_session() -> requests.Session:
@@ -194,7 +205,7 @@ def main() -> None:
     PROCESSED_DATA_DIR.mkdir(exist_ok=True)
     TEMP_CHUNK_DIR = PROCESSED_DATA_DIR / "temp_chunks"
     TEMP_CHUNK_DIR.mkdir(exist_ok=True)
-    log("─ Start Structured Text Extraction (Chunked Mode) ─")
+    log("─ Start Structured Text Extraction (Production Edition) ─")
 
     if not URL_LIST_FILE.exists():
         logger.error(f"URL list missing: {URL_LIST_FILE}")
@@ -228,52 +239,80 @@ def main() -> None:
 
     CHUNK_SIZE = 1000
     results_buffer = []
+    last_log_time = time.time()
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_url = {
-                executor.submit(fetch, item["url"], item["label"]): item["url"]
-                for item in urls_to_process
-            }
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor, tqdm(
+            total=stats.total, desc="Fetching URLs"
+        ) as pbar:
+            inflight = {}
+            url_iterator = iter(urls_to_process)
 
-            for future in tqdm(
-                as_completed(future_to_url), total=stats.total, desc="Fetching"
-            ):
-                try:
-                    result = future.result()
-                    if result.get("status") == "success":
-                        del result["status"]
-                        results_buffer.append(result)
-                        stats.success += 1
-                    else:
+            while True:
+                while len(inflight) < MAX_INFLIGHT:
+                    try:
+                        item = next(url_iterator)
+                        future = executor.submit(fetch, item["url"], item["label"])
+                        inflight[future] = item["url"]
+                    except StopIteration:
+                        url_iterator = None
+                        break
+
+                if not inflight:
+                    break
+
+                done, _ = wait(
+                    inflight.keys(), timeout=1.0, return_when=FIRST_COMPLETED
+                )
+
+                for future in done:
+                    url = inflight.pop(future)
+                    try:
+                        result = future.result()
+                        if result.get("status") == "success":
+                            del result["status"]
+                            results_buffer.append(result)
+                            stats.success += 1
+                        else:
+                            stats.failed += 1
+                    except Exception as e:
+                        logger.error(f"Worker for {url} raised exception: {e}")
                         stats.failed += 1
-                except Exception as e:
-                    logger.error(
-                        f"Worker for {future_to_url[future]} raised exception: {e}"
-                    )
-                    stats.failed += 1
+
+                    pbar.update(1)
+                    stats.processed_since_log += 1
 
                 if len(results_buffer) >= CHUNK_SIZE:
                     chunk_num = len(list(TEMP_CHUNK_DIR.glob("_temp_*.parquet")))
-                    chunk_file = TEMP_CHUNK_DIR / f"_temp_chunk_{chunk_num}.parquet"
                     pd.DataFrame(results_buffer).to_parquet(
-                        chunk_file, compression="ZSTD", index=False
+                        TEMP_CHUNK_DIR / f"_temp_chunk_{chunk_num}.parquet",
+                        compression="ZSTD",
+                        index=False,
                     )
                     results_buffer.clear()
                     gc.collect()
+
+                current_time = time.time()
+                if current_time - last_log_time >= LOG_INTERVAL_SECONDS:
+                    elapsed = current_time - last_log_time
+                    log(stats.get_progress_str(elapsed))
+                    last_log_time = current_time
+                    stats.processed_since_log = 0
 
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user. Saving final buffer...")
     finally:
         if results_buffer:
             chunk_num = len(list(TEMP_CHUNK_DIR.glob("_temp_*.parquet")))
-            chunk_file = TEMP_CHUNK_DIR / f"_temp_chunk_{chunk_num+1}.parquet"
             pd.DataFrame(results_buffer).to_parquet(
-                chunk_file, compression="ZSTD", index=False
+                TEMP_CHUNK_DIR / f"_temp_chunk_{chunk_num+1}.parquet",
+                compression="ZSTD",
+                index=False,
             )
 
-        log("─ Fetching complete. Consolidating final data. ─")
-        log(f"Final Stats: {stats}")
+        log(
+            f"Final Stats: Success={stats.success}, Failed={stats.failed}, Skipped={stats.skipped}"
+        )
 
     consolidate_chunks(TEMP_CHUNK_DIR, ENRICHED_DATA_FILE)
     log("─ All Done ─", t_global)
