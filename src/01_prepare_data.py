@@ -148,6 +148,7 @@ def fetch(url: str, label: int) -> dict:
             if LOG_SUCCESS:
                 logger.info(f"Success: {url}")
         else:
+            out["html_content"] = html
             out["status"] = "success_empty"
     except requests.RequestException as e:
         logger.warning(f"Request failed for {url}: {type(e).__name__}")
@@ -269,10 +270,10 @@ def main() -> None:
                     url = inflight.pop(future)
                     try:
                         result = future.result()
-                        if result.get("status") == "success":
+                        if result.get("status") in ("success", "success_empty"):
+                            stats.success += 1
                             del result["status"]
                             results_buffer.append(result)
-                            stats.success += 1
                         else:
                             stats.failed += 1
                     except Exception as e:

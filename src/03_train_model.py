@@ -167,7 +167,7 @@ class FeatureEngineer:
                     i, columns=["url", "structured_text", "label", "html_content"]
                 )
                 .to_pandas()
-                .dropna()
+                .dropna(subset=["url", "label"])
             )
             if df.empty:
                 continue
@@ -176,7 +176,10 @@ class FeatureEngineer:
                 lambda sl: " ".join(
                     d.get("text", "") for d in sl if isinstance(sl, list)
                 )
+                if sl
+                else ""
             )
+            df["html_content"] = df["html_content"].fillna("")
 
             X_chunk, feature_shapes = self._vectorize_chunk(df)
             if i == 0:

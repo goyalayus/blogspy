@@ -2,7 +2,7 @@ import pandas as pd
 import pathlib
 import os
 
-CORPORATE_FILE_PATH = pathlib.Path(__file__).parent / "data" / "raw" / "corporate.csv"
+CORPORATE_FILE_PATH = pathlib.Path("data") / "raw" / "corporate.csv"
 
 
 def standardize_file(file_path: pathlib.Path):
