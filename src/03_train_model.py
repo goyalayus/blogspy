@@ -1,5 +1,3 @@
-# src/03_train_model.py
-# ─────────────────────────────────────────────────────────
 """
 BlogSpy – fault-tolerant, memory-safe training pipeline
 
@@ -9,18 +7,22 @@ re-running from the cached feature matrix to avoid rebuilding.
 
 from __future__ import annotations
 
-# ---------- Local imports --------------------------------------------------
 from src.utils import get_logger
 from src.feature_engineering import (
-    extract_url_features, extract_structural_features, extract_content_features
+    extract_url_features,
+    extract_structural_features,
+    extract_content_features,
 )
 from src.config import (
-    ENRICHED_DATA_FILE, TEST_SIZE, RANDOM_STATE,
-    MODELS_DIR, REPORTS_DIR, ID_TO_LABEL, LGBM_PARAMS
+    ENRICHED_DATA_FILE,
+    TEST_SIZE,
+    RANDOM_STATE,
+    MODELS_DIR,
+    REPORTS_DIR,
+    ID_TO_LABEL,
+    LGBM_PARAMS,
 )
-# --------------------------------------------------------------------------
 
-# ---------- Third-party imports -------------------------------------------
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, ConfusionMatrixDisplay
@@ -34,9 +36,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import joblib
-# --------------------------------------------------------------------------
 
-# ---------- Std-lib imports ------------------------------------------------
 import warnings
 import gc
 import argparse
@@ -44,7 +44,6 @@ import sys
 import pathlib
 import resource
 from typing import List
-# --------------------------------------------------------------------------
 
 project_root = pathlib.Path(__file__).parent.parent
 sys.path.append(str(project_root))
@@ -52,13 +51,10 @@ sys.path.append(str(project_root))
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 logger = get_logger(__name__)
 
-# [FIX] Re-adding missing constants
-HASH_DIM = 2 ** 16
+HASH_DIM = 2**16
 MEM_LIMIT_GB = 6
 FEATURES_FILE = project_root / "data/processed/X_hashtfidf.npz"
 LABELS_FILE = project_root / "data/processed/y.npy"
-
-# ... (log_memory and _set_memory_cap are unchanged) ...
 
 
 def log_memory(msg: str):
@@ -76,22 +72,34 @@ def _set_memory_cap(gb: int | None) -> None:
     except Exception as e:
         logger.warning(f"Could not set memory cap: {e}")
 
-# ───────────────── Feature building ────────────────────────────────────────
-
 
 def _vectorise_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
     txt = hv.transform(df["text_content"].fillna(""))
     url_dense = extract_url_features(df["url"]).to_numpy(dtype="float32")
-    structural = extract_structural_features(
-        df["html_content"]).to_numpy(dtype="float32")
-    content = extract_content_features(
-        df["text_content"]).to_numpy(dtype="float32")
-    return sp.hstack([txt, sp.csr_matrix(url_dense), sp.csr_matrix(structural), sp.csr_matrix(content)], format="csr")
+    structural = extract_structural_features(df["html_content"]).to_numpy(
+        dtype="float32"
+    )
+    content = extract_content_features(df["text_content"]).to_numpy(dtype="float32")
+    return sp.hstack(
+        [
+            txt,
+            sp.csr_matrix(url_dense),
+            sp.csr_matrix(structural),
+            sp.csr_matrix(content),
+        ],
+        format="csr",
+    )
 
 
 def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
-    hv = HashingVectorizer(stop_words="english", n_features=HASH_DIM, ngram_range=(1, 2),
-                           alternate_sign=False, norm="l2", dtype=np.float32)
+    hv = HashingVectorizer(
+        stop_words="english",
+        n_features=HASH_DIM,
+        ngram_range=(1, 2),
+        alternate_sign=False,
+        norm="l2",
+        dtype=np.float32,
+    )
     X_parts: List[sp.csr_matrix] = []
     y_parts: List[np.ndarray] = []
 
@@ -99,8 +107,11 @@ def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
     pf = pq.ParquetFile(ENRICHED_DATA_FILE)
     wanted = ["url", "html_content", "text_content", "label"]
     for i in tqdm(range(pf.num_row_groups), desc="Processing Chunks"):
-        df = pf.read_row_group(i, columns=wanted).to_pandas().dropna(
-            subset=["html_content", "text_content"])
+        df = (
+            pf.read_row_group(i, columns=wanted)
+            .to_pandas()
+            .dropna(subset=["html_content", "text_content"])
+        )
         if df.empty:
             continue
         X_parts.append(_vectorise_chunk(df, hv))
@@ -117,12 +128,18 @@ def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
     log_memory("Feature cache written to disk.")
     return X, y, hv
 
-# [FIX] Adjusted logic to allow using cache
 
-
-def load_or_build_features(rebuild: bool) -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
-    hv = HashingVectorizer(stop_words="english", n_features=HASH_DIM, ngram_range=(1, 2),
-                           alternate_sign=False, norm="l2", dtype=np.float32)
+def load_or_build_features(
+    rebuild: bool,
+) -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
+    hv = HashingVectorizer(
+        stop_words="english",
+        n_features=HASH_DIM,
+        ngram_range=(1, 2),
+        alternate_sign=False,
+        norm="l2",
+        dtype=np.float32,
+    )
 
     if (not rebuild) and FEATURES_FILE.exists() and LABELS_FILE.exists():
         log_memory("Found cached features. Loading from disk...")
@@ -132,10 +149,9 @@ def load_or_build_features(rebuild: bool) -> tuple[sp.csr_matrix, np.ndarray, Ha
         return X, y, hv
 
     log_memory(
-        "No cache found or --rebuild flag used. Building features from scratch...")
+        "No cache found or --rebuild flag used. Building features from scratch..."
+    )
     return build_features()
-
-# ─────────────────────────── main (FINAL VERSION) ──────────
 
 
 def main(rebuild: bool) -> None:
@@ -145,10 +161,8 @@ def main(rebuild: bool) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) Feature matrix (cached or rebuilt)
     X, y, vectorizer = load_or_build_features(rebuild)
 
-    # 2) Train/test split
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
     )
@@ -157,7 +171,6 @@ def main(rebuild: bool) -> None:
     gc.collect()
     log_memory("Full feature matrix (X, y) cleared from RAM.")
 
-    # 3) Create LightGBM Datasets
     train_data = lgb.Dataset(X_tr, label=y_tr)
     val_data = lgb.Dataset(X_te, label=y_te, reference=train_data)
     log_memory("LightGBM Dataset objects created.")
@@ -165,18 +178,25 @@ def main(rebuild: bool) -> None:
     gc.collect()
     log_memory("Original training matrix (X_tr, y_tr) cleared.")
 
-    # 4) Fit LightGBM using the native API
     params = LGBM_PARAMS.copy()
     num_boost_round = params.pop("n_estimators")
-    callbacks = [lgb.early_stopping(
-        stopping_rounds=25, verbose=True), lgb.log_evaluation(period=50)]
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=25, verbose=True),
+        lgb.log_evaluation(period=50),
+    ]
     log_memory(
-        f"Starting lgb.train with max_bin={params['max_bin']} and num_leaves={params['num_leaves']}...")
-    booster = lgb.train(params, train_data, num_boost_round=num_boost_round,
-                        valid_sets=[val_data], valid_names=['eval'], callbacks=callbacks)
+        f"Starting lgb.train with max_bin={params['max_bin']} and num_leaves={params['num_leaves']}..."
+    )
+    booster = lgb.train(
+        params,
+        train_data,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_data],
+        valid_names=["eval"],
+        callbacks=callbacks,
+    )
     log_memory("lgb.train has finished successfully.")
 
-    # 5) Evaluate directly using the booster
     log_memory("Evaluating model on the test set...")
     pred_probs = booster.predict(X_te)
     preds = (pred_probs > 0.5).astype(int)
@@ -191,18 +211,19 @@ def main(rebuild: bool) -> None:
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ConfusionMatrixDisplay.from_predictions(
-        y_te, preds, display_labels=[ID_TO_LABEL[0], ID_TO_LABEL[1]], cmap="Blues", ax=ax)
+        y_te,
+        preds,
+        display_labels=[ID_TO_LABEL[0], ID_TO_LABEL[1]],
+        cmap="Blues",
+        ax=ax,
+    )
     ax.set_title("Confusion Matrix – Final Model")
     plt.tight_layout()
     plt.savefig(REPORTS_DIR / "lgbm_final_classification_report.png")
     plt.close(fig)
     log_memory("Confusion-matrix plot saved.")
 
-    # 6) Save the vectorizer and the raw booster
-    artifact = {
-        "vectorizer": vectorizer,
-        "model": booster
-    }
+    artifact = {"vectorizer": vectorizer, "model": booster}
     joblib.dump(artifact, MODELS_DIR / "ayush.joblib")
     log_memory("Model artifacts (vectorizer + booster) saved. ✅")
     log_memory("--- Pipeline End ---")
@@ -210,8 +231,10 @@ def main(rebuild: bool) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Train the main BlogSpy model.")
-    # You can force a rebuild if needed, otherwise it will use the cache.
-    ap.add_argument("--rebuild", action="store_true",
-                    help="Force rebuilding the feature matrix cache")
+    ap.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force rebuilding the feature matrix cache",
+    )
     args = ap.parse_args()
     main(rebuild=args.rebuild)
