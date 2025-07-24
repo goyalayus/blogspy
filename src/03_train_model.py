@@ -1,8 +1,8 @@
 """
 BlogSpy – fault-tolerant, memory-safe training pipeline
 
-[FIX-4] Re-adds missing constants (HASH_DIM, MEM_LIMIT_GB) and allows
-re-running from the cached feature matrix to avoid rebuilding.
+[FIX-5] Refactored to pull all hyperparameters from the central config file.
+Model parameters are now tuned for performance over extreme memory savings.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from src.config import (
     REPORTS_DIR,
     ID_TO_LABEL,
     LGBM_PARAMS,
+    HASH_DIM,
+    MEM_LIMIT_GB,
 )
 
 from tqdm import tqdm
@@ -51,8 +53,6 @@ sys.path.append(str(project_root))
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 logger = get_logger(__name__)
 
-HASH_DIM = 2**16
-MEM_LIMIT_GB = 6
 FEATURES_FILE = project_root / "data/processed/X_hashtfidf.npz"
 LABELS_FILE = project_root / "data/processed/y.npy"
 
