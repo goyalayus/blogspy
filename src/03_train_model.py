@@ -1,8 +1,9 @@
 """
 BlogSpy – fault-tolerant, memory-safe training pipeline
 
-[FIX-5] Refactored to pull all hyperparameters from the central config file.
-Model parameters are now tuned for performance over extreme memory savings.
+[FIX-6] Adds error analysis by saving incorrectly classified test set URLs
+to a CSV file for review. The URL data is now cached and tracked throughout
+the pipeline to enable this.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ import argparse
 import sys
 import pathlib
 import resource
-from typing import List
+from typing import List, Dict, Tuple
 
 project_root = pathlib.Path(__file__).parent.parent
 sys.path.append(str(project_root))
@@ -53,8 +54,9 @@ sys.path.append(str(project_root))
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 logger = get_logger(__name__)
 
-FEATURES_FILE = project_root / "data/processed/X_hashtfidf.npz"
-LABELS_FILE = project_root / "data/processed/y.npy"
+FEATURES_FILE = project_root / "data/processed/X_features.npz"
+LABELS_FILE = project_root / "data/processed/y_labels.npy"
+URLS_FILE = project_root / "data/processed/urls.npy"
 
 
 def log_memory(msg: str):
@@ -91,7 +93,7 @@ def _vectorise_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
     )
 
 
-def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
+def build_features() -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
     hv = HashingVectorizer(
         stop_words="english",
         n_features=HASH_DIM,
@@ -102,6 +104,7 @@ def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
     )
     X_parts: List[sp.csr_matrix] = []
     y_parts: List[np.ndarray] = []
+    url_parts: List[np.ndarray] = []
 
     log_memory("Starting feature building process...")
     pf = pq.ParquetFile(ENRICHED_DATA_FILE)
@@ -116,22 +119,25 @@ def build_features() -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
             continue
         X_parts.append(_vectorise_chunk(df, hv))
         y_parts.append(df["label"].to_numpy(dtype="int8"))
+        url_parts.append(df["url"].to_numpy(dtype=object))
 
-    log_memory("Finished reading chunks. Now stacking matrices...")
+    log_memory("Finished reading chunks. Now stacking matrices and arrays...")
     X = sp.vstack(X_parts, format="csr")
     y = np.concatenate(y_parts)
-    log_memory(f"Final corpus created: {X.shape}")
+    urls = np.concatenate(url_parts)
+    log_memory(f"Final corpus created: X{X.shape}, y{y.shape}, urls{urls.shape}")
 
     FEATURES_FILE.parent.mkdir(parents=True, exist_ok=True)
     sp.save_npz(FEATURES_FILE, X)
     np.save(LABELS_FILE, y)
-    log_memory("Feature cache written to disk.")
-    return X, y, hv
+    np.save(URLS_FILE, urls)
+    log_memory("Feature, label, and URL cache written to disk.")
+    return X, y, urls, hv
 
 
 def load_or_build_features(
     rebuild: bool,
-) -> tuple[sp.csr_matrix, np.ndarray, HashingVectorizer]:
+) -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
     hv = HashingVectorizer(
         stop_words="english",
         n_features=HASH_DIM,
@@ -141,17 +147,61 @@ def load_or_build_features(
         dtype=np.float32,
     )
 
-    if (not rebuild) and FEATURES_FILE.exists() and LABELS_FILE.exists():
-        log_memory("Found cached features. Loading from disk...")
+    if (
+        (not rebuild)
+        and FEATURES_FILE.exists()
+        and LABELS_FILE.exists()
+        and URLS_FILE.exists()
+    ):
+        log_memory("Found cached features, labels, and URLs. Loading from disk...")
         X = sp.load_npz(FEATURES_FILE)
         y = np.load(LABELS_FILE)
-        log_memory(f"Loaded X{X.shape}, y{y.shape} from cache.")
-        return X, y, hv
+        urls = np.load(URLS_FILE, allow_pickle=True)
+        log_memory(f"Loaded X{X.shape}, y{y.shape}, urls{urls.shape} from cache.")
+        return X, y, urls, hv
 
     log_memory(
         "No cache found or --rebuild flag used. Building features from scratch..."
     )
     return build_features()
+
+
+def _save_incorrect_predictions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    pred_probs: np.ndarray,
+    urls: np.ndarray,
+    output_path: pathlib.Path,
+    id_to_label_map: Dict[int, str],
+) -> None:
+    incorrect_indices = np.where(y_true != y_pred)[0]
+    if len(incorrect_indices) == 0:
+        logger.info("✅ No incorrect predictions found on the test set. Excellent!")
+        return
+
+    incorrect_data = {
+        "url": urls[incorrect_indices],
+        "true_label": y_true[incorrect_indices],
+        "predicted_label": y_pred[incorrect_indices],
+        "confidence": pred_probs[incorrect_indices],
+    }
+    df_incorrect = pd.DataFrame(incorrect_data)
+    df_incorrect["true_label_name"] = df_incorrect["true_label"].map(id_to_label_map)
+    df_incorrect["predicted_label_name"] = df_incorrect["predicted_label"].map(
+        id_to_label_map
+    )
+
+    df_incorrect["confidence_in_prediction"] = np.where(
+        df_incorrect["predicted_label"] == 1,
+        df_incorrect["confidence"],
+        1 - df_incorrect["confidence"],
+    )
+    df_incorrect = df_incorrect[
+        ["url", "true_label_name", "predicted_label_name", "confidence_in_prediction"]
+    ]
+
+    df_incorrect.to_csv(output_path, index=False)
+    log_memory(f"Saved {len(df_incorrect)} incorrect predictions to {output_path}")
 
 
 def main(rebuild: bool) -> None:
@@ -161,15 +211,15 @@ def main(rebuild: bool) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    X, y, vectorizer = load_or_build_features(rebuild)
+    X, y, urls, vectorizer = load_or_build_features(rebuild)
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+    X_tr, X_te, y_tr, y_te, urls_tr, urls_te = train_test_split(
+        X, y, urls, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
     )
     log_memory(f"Data split into Train {X_tr.shape} and Test {X_te.shape}")
-    del X, y
+    del X, y, urls, urls_tr
     gc.collect()
-    log_memory("Full feature matrix (X, y) cleared from RAM.")
+    log_memory("Full feature matrix (X, y, urls) cleared from RAM.")
 
     train_data = lgb.Dataset(X_tr, label=y_tr)
     val_data = lgb.Dataset(X_te, label=y_te, reference=train_data)
@@ -209,6 +259,15 @@ def main(rebuild: bool) -> None:
     (REPORTS_DIR / "lgbm_final_classification_report.txt").write_text(report)
     log_memory("Classification report saved.")
 
+    _save_incorrect_predictions(
+        y_true=y_te,
+        y_pred=preds,
+        pred_probs=pred_probs,
+        urls=urls_te,
+        output_path=REPORTS_DIR / "lgbm_incorrect_predictions.csv",
+        id_to_label_map=ID_TO_LABEL,
+    )
+
     fig, ax = plt.subplots(figsize=(8, 6))
     ConfusionMatrixDisplay.from_predictions(
         y_te,
@@ -219,7 +278,7 @@ def main(rebuild: bool) -> None:
     )
     ax.set_title("Confusion Matrix – Final Model")
     plt.tight_layout()
-    plt.savefig(REPORTS_DIR / "lgbm_final_classification_report.png")
+    plt.savefig(REPORTS_DIR / "lgbm_final_confusion_matrix.png")
     plt.close(fig)
     log_memory("Confusion-matrix plot saved.")
 
