@@ -1,210 +1,260 @@
 """
-BlogSpy – fault-tolerant, memory-safe training pipeline
+BlogSpy – fault-tolerant, memory-safe, and parallelized training pipeline
 
-[FIX-6] Adds error analysis by saving incorrectly classified test set URLs
-to a CSV file for review. The URL data is now cached and tracked throughout
-the pipeline to enable this.
+[FINAL VERSION]
+This script performs the full model training pipeline and is optimized for
+multi-core machines.
+
+1.  Loads or builds a feature matrix from the enriched Parquet data.
+    - If --rebuild is used, it now uses a parallel multiprocessing approach
+      to build features significantly faster, leveraging all available CPUs.
+    - Caches the expensive-to-build feature matrix to disk for rapid re-runs.
+2.  Implements aggressive memory management to prevent out-of-memory errors
+    during model training, even on large datasets.
+3.  Trains a LightGBM model, evaluates its performance, and saves the final
+    model artifact (containing both the trained model and its vectorizer).
+4.  Adds error analysis by saving incorrectly classified test set URLs
+    to a CSV file for review.
 """
 
 from __future__ import annotations
-
 from src.utils import get_logger
-from src.feature_engineering import (
-    extract_url_features,
-    extract_structural_features,
-    extract_content_features,
-)
-from src.config import (
-    ENRICHED_DATA_FILE,
-    TEST_SIZE,
-    RANDOM_STATE,
-    MODELS_DIR,
-    REPORTS_DIR,
-    ID_TO_LABEL,
-    LGBM_PARAMS,
-    HASH_DIM,
-    MEM_LIMIT_GB,
-)
+from src.feature_engineering import (extract_content_features,
+                                     extract_structural_features,
+                                     extract_url_features)
+from src.config import (ENRICHED_DATA_FILE, HASH_DIM, ID_TO_LABEL, LGBM_PARAMS,
+                        MEM_LIMIT_GB, MODELS_DIR, RANDOM_STATE, REPORTS_DIR,
+                        TEST_SIZE)
 
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, ConfusionMatrixDisplay
-from sklearn.feature_extraction.text import HashingVectorizer
-import lightgbm as lgb
-from bs4 import XMLParsedAsHTMLWarning
-import scipy.sparse as sp
-import pyarrow.parquet as pq
-import psutil
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import joblib
-
-import warnings
-import gc
+# ---------- Standard Library Imports ---------------------------------------
 import argparse
-import sys
+import gc
+import multiprocessing
 import pathlib
 import resource
-from typing import List, Dict, Tuple
+import sys
+import warnings
+from typing import Dict, List, Tuple
 
+# ---------- Third-Party Imports --------------------------------------------
+import joblib
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import psutil
+import pyarrow.parquet as pq
+import scipy.sparse as sp
+from bs4 import XMLParsedAsHTMLWarning
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+# ---------- Local Imports --------------------------------------------------
 project_root = pathlib.Path(__file__).parent.parent
 sys.path.append(str(project_root))
+
+
+# ---------------------------------------------------------------------------
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 logger = get_logger(__name__)
 
-FEATURES_FILE = project_root / "data/processed/X_features.npz"
-LABELS_FILE = project_root / "data/processed/y_labels.npy"
-URLS_FILE = project_root / "data/processed/urls.npy"
+# --- File Paths for Caching ---
+PROCESSED_DATA_DIR = project_root / "data/processed"
+FEATURES_FILE = PROCESSED_DATA_DIR / "X_features.npz"
+LABELS_FILE = PROCESSED_DATA_DIR / "y_labels.npy"
+URLS_FILE = PROCESSED_DATA_DIR / "urls.npy"
+
+# Used to create a consistent vectorizer in multiple places
+VECTORIZER_NGRAM_RANGE = (1, 2)
 
 
 def log_memory(msg: str):
+    """Logs a message with the current process memory usage."""
     mem_gb = psutil.Process().memory_info().rss / 1e9
     logger.info(f"{f'[{mem_gb:.2f} GB]':<10} {msg}")
 
 
 def _set_memory_cap(gb: int | None) -> None:
-    if gb is None:
+    """Sets a soft memory limit for the process (Linux/macOS only)."""
+    if gb is None or sys.platform == "win32":
         return
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         resource.setrlimit(resource.RLIMIT_AS, (gb * 1024**3, hard))
-        log_memory(f"Soft RLIMIT_AS set to {gb} GB")
-    except Exception as e:
+        log_memory(f"Soft memory limit (RLIMIT_AS) set to {gb} GB")
+    except (ValueError, ModuleNotFoundError) as e:
         logger.warning(f"Could not set memory cap: {e}")
 
 
-def _vectorise_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
-    txt = hv.transform(df["text_content"].fillna(""))
-    url_dense = extract_url_features(df["url"]).to_numpy(dtype="float32")
-    structural = extract_structural_features(df["html_content"]).to_numpy(
-        dtype="float32"
-    )
-    content = extract_content_features(df["text_content"]).to_numpy(dtype="float32")
-    return sp.hstack(
-        [
-            txt,
-            sp.csr_matrix(url_dense),
-            sp.csr_matrix(structural),
-            sp.csr_matrix(content),
-        ],
-        format="csr",
-    )
+# ───────────────── Feature Engineering (Parallelized) ──────────────────────
+
+def _vectorize_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
+    """Vectorizes a single DataFrame chunk into a sparse feature matrix."""
+    text_features = hv.transform(df["text_content"].fillna(""))
+    url_features = extract_url_features(df["url"]).to_numpy(dtype="float32")
+    structural_features = extract_structural_features(
+        df["html_content"]).to_numpy(dtype="float32")
+    content_features = extract_content_features(
+        df["text_content"]).to_numpy(dtype="float32")
+    return sp.hstack([
+        text_features,
+        sp.csr_matrix(url_features),
+        sp.csr_matrix(structural_features),
+        sp.csr_matrix(content_features)
+    ], format="csr")
 
 
-def build_features() -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
+def _process_chunk_worker(chunk_index: int) -> tuple[sp.csr_matrix | None, np.ndarray | None, np.ndarray | None]:
+    """
+    Worker function executed by each parallel process.
+    It reads and processes a single data chunk.
+    """
+    # NOTE: The HashingVectorizer and ParquetFile handle are created here
+    # to be local to each process, avoiding serialization errors.
     hv = HashingVectorizer(
-        stop_words="english",
-        n_features=HASH_DIM,
-        ngram_range=(1, 2),
-        alternate_sign=False,
-        norm="l2",
-        dtype=np.float32,
+        stop_words="english", n_features=HASH_DIM,
+        ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
+        norm="l2", dtype=np.float32
     )
-    X_parts: List[sp.csr_matrix] = []
-    y_parts: List[np.ndarray] = []
-    url_parts: List[np.ndarray] = []
-
-    log_memory("Starting feature building process...")
     pf = pq.ParquetFile(ENRICHED_DATA_FILE)
-    wanted = ["url", "html_content", "text_content", "label"]
-    for i in tqdm(range(pf.num_row_groups), desc="Processing Chunks"):
-        df = (
-            pf.read_row_group(i, columns=wanted)
-            .to_pandas()
-            .dropna(subset=["html_content", "text_content"])
-        )
-        if df.empty:
-            continue
-        X_parts.append(_vectorise_chunk(df, hv))
-        y_parts.append(df["label"].to_numpy(dtype="int8"))
-        url_parts.append(df["url"].to_numpy(dtype=object))
 
-    log_memory("Finished reading chunks. Now stacking matrices and arrays...")
+    required_cols = ["url", "html_content", "text_content", "label"]
+    df_chunk = pf.read_row_group(
+        chunk_index, columns=required_cols).to_pandas().dropna(subset=["url", "label"])
+
+    if df_chunk.empty:
+        return None, None, None
+
+    X_chunk = _vectorize_chunk(df_chunk, hv)
+    y_chunk = df_chunk["label"].to_numpy(dtype="int8")
+    urls_chunk = df_chunk["url"].to_numpy(dtype=object)
+
+    return X_chunk, y_chunk, urls_chunk
+
+
+def build_features_from_scratch() -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
+    """
+    Builds the complete feature matrix in parallel using multiprocessing
+    to leverage all available CPU cores.
+    """
+    log_memory("Starting PARALLEL feature building from scratch...")
+
+    pf = pq.ParquetFile(ENRICHED_DATA_FILE)
+    num_chunks = pf.num_row_groups
+    del pf
+
+    num_workers = max(1, multiprocessing.cpu_count() - 1)
+    log_memory(
+        f"Distributing {num_chunks} chunks across {num_workers} worker processes...")
+
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        # Use pool.imap to preserve the order of results, which is critical.
+        results = list(tqdm(
+            pool.imap(_process_chunk_worker, range(num_chunks)),
+            total=num_chunks,
+            desc="Processing Chunks (Parallel)"
+        ))
+
+    results = [res for res in results if res[0] is not None]
+    X_parts, y_parts, url_parts = zip(*results)
+
+    log_memory("Finished processing all chunks. Now stacking results...")
     X = sp.vstack(X_parts, format="csr")
     y = np.concatenate(y_parts)
     urls = np.concatenate(url_parts)
-    log_memory(f"Final corpus created: X{X.shape}, y{y.shape}, urls{urls.shape}")
+    log_memory(
+        f"Final feature matrix created: X{X.shape}, y{y.shape}, urls{urls.shape}")
 
-    FEATURES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     sp.save_npz(FEATURES_FILE, X)
     np.save(LABELS_FILE, y)
     np.save(URLS_FILE, urls)
-    log_memory("Feature, label, and URL cache written to disk.")
-    return X, y, urls, hv
+    log_memory(f"Feature cache written to disk at '{PROCESSED_DATA_DIR}'.")
 
-
-def load_or_build_features(
-    rebuild: bool,
-) -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
-    hv = HashingVectorizer(
-        stop_words="english",
-        n_features=HASH_DIM,
-        ngram_range=(1, 2),
-        alternate_sign=False,
-        norm="l2",
-        dtype=np.float32,
+    # Return a final vectorizer instance for the main function to use
+    final_hv = HashingVectorizer(
+        stop_words="english", n_features=HASH_DIM,
+        ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
+        norm="l2", dtype=np.float32
     )
+    return X, y, urls, final_hv
 
-    if (
-        (not rebuild)
-        and FEATURES_FILE.exists()
-        and LABELS_FILE.exists()
-        and URLS_FILE.exists()
-    ):
-        log_memory("Found cached features, labels, and URLs. Loading from disk...")
+
+def load_or_build_features(rebuild: bool) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
+    """
+    Loads features from cache if available. Otherwise, builds them from scratch
+    using a parallelized process.
+    """
+    if (not rebuild) and FEATURES_FILE.exists() and LABELS_FILE.exists() and URLS_FILE.exists():
+        log_memory(
+            "Found cached features, labels, and URLs. Loading from disk...")
         X = sp.load_npz(FEATURES_FILE)
         y = np.load(LABELS_FILE)
         urls = np.load(URLS_FILE, allow_pickle=True)
-        log_memory(f"Loaded X{X.shape}, y{y.shape}, urls{urls.shape} from cache.")
+        log_memory(
+            f"Loaded X{X.shape}, y{y.shape}, urls{urls.shape} from cache.")
+        # Return a vectorizer with matching settings for the loaded data
+        hv = HashingVectorizer(
+            # Infer from loaded X
+            stop_words="english", n_features=X.shape[1] - 12,
+            ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
+            norm="l2", dtype=np.float32
+        )
         return X, y, urls, hv
 
-    log_memory(
-        "No cache found or --rebuild flag used. Building features from scratch..."
-    )
-    return build_features()
+    return build_features_from_scratch()
 
 
 def _save_incorrect_predictions(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    pred_probs: np.ndarray,
-    urls: np.ndarray,
-    output_path: pathlib.Path,
-    id_to_label_map: Dict[int, str],
+    y_true: np.ndarray, y_pred: np.ndarray, pred_probs: np.ndarray,
+    urls: np.ndarray, output_path: pathlib.Path, id_to_label_map: Dict[int, str]
 ) -> None:
+    """Saves a CSV of misclassified URLs for error analysis."""
     incorrect_indices = np.where(y_true != y_pred)[0]
     if len(incorrect_indices) == 0:
-        logger.info("✅ No incorrect predictions found on the test set. Excellent!")
+        logger.info(
+            "✅ No incorrect predictions found on the test set. Excellent!")
         return
+
+    pred_is_binary_prob = len(pred_probs.shape) == 1
 
     incorrect_data = {
         "url": urls[incorrect_indices],
         "true_label": y_true[incorrect_indices],
         "predicted_label": y_pred[incorrect_indices],
-        "confidence": pred_probs[incorrect_indices],
     }
-    df_incorrect = pd.DataFrame(incorrect_data)
-    df_incorrect["true_label_name"] = df_incorrect["true_label"].map(id_to_label_map)
-    df_incorrect["predicted_label_name"] = df_incorrect["predicted_label"].map(
-        id_to_label_map
-    )
 
-    df_incorrect["confidence_in_prediction"] = np.where(
-        df_incorrect["predicted_label"] == 1,
-        df_incorrect["confidence"],
-        1 - df_incorrect["confidence"],
-    )
-    df_incorrect = df_incorrect[
-        ["url", "true_label_name", "predicted_label_name", "confidence_in_prediction"]
-    ]
+    df_incorrect = pd.DataFrame(incorrect_data)
+    df_incorrect["true_label_name"] = df_incorrect["true_label"].map(
+        id_to_label_map)
+    df_incorrect["predicted_label_name"] = df_incorrect["predicted_label"].map(
+        id_to_label_map)
+
+    if pred_is_binary_prob:
+        df_incorrect["confidence"] = pred_probs[incorrect_indices]
+        df_incorrect["confidence_in_prediction"] = np.where(
+            df_incorrect["predicted_label"] == 1,
+            df_incorrect["confidence"],
+            1 - df_incorrect["confidence"],
+        )
+
+    cols_to_keep = ["url", "true_label_name",
+                    "predicted_label_name", "confidence_in_prediction"]
+    df_incorrect = df_incorrect[[
+        c for c in cols_to_keep if c in df_incorrect.columns]]
 
     df_incorrect.to_csv(output_path, index=False)
-    log_memory(f"Saved {len(df_incorrect)} incorrect predictions to {output_path}")
+    log_memory(
+        f"Saved {len(df_incorrect)} incorrect predictions to {output_path}")
 
+
+# ─────────────────────────── Main Training Pipeline ──────────────────────────
 
 def main(rebuild: bool) -> None:
+    """Main function to run the end-to-end training pipeline."""
     log_memory("--- Pipeline Start ---")
     _set_memory_cap(MEM_LIMIT_GB)
 
@@ -213,11 +263,17 @@ def main(rebuild: bool) -> None:
 
     X, y, urls, vectorizer = load_or_build_features(rebuild)
 
-    X_tr, X_te, y_tr, y_te, urls_tr, urls_te = train_test_split(
+    num_classes = len(np.unique(y))
+    if num_classes < 2:
+        logger.error(
+            f"Training requires at least 2 classes, but found {num_classes}. Aborting.")
+        return
+
+    X_tr, X_te, y_tr, y_te, _, urls_te = train_test_split(
         X, y, urls, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
     )
     log_memory(f"Data split into Train {X_tr.shape} and Test {X_te.shape}")
-    del X, y, urls, urls_tr
+    del X, y, urls
     gc.collect()
     log_memory("Full feature matrix (X, y, urls) cleared from RAM.")
 
@@ -226,74 +282,67 @@ def main(rebuild: bool) -> None:
     log_memory("LightGBM Dataset objects created.")
     del X_tr, y_tr
     gc.collect()
-    log_memory("Original training matrix (X_tr, y_tr) cleared.")
+    log_memory("Original training matrix (X_tr, y_tr) cleared from RAM.")
 
     params = LGBM_PARAMS.copy()
-    num_boost_round = params.pop("n_estimators")
-    callbacks = [
-        lgb.early_stopping(stopping_rounds=25, verbose=True),
-        lgb.log_evaluation(period=50),
-    ]
-    log_memory(
-        f"Starting lgb.train with max_bin={params['max_bin']} and num_leaves={params['num_leaves']}..."
-    )
+    if num_classes > 2:
+        params.update({"objective": "multiclass", "num_class": num_classes})
+
+    num_boost_round = params.pop("n_estimators", 1000)
+    callbacks = [lgb.early_stopping(
+        stopping_rounds=50, verbose=True), lgb.log_evaluation(period=100)]
+
+    log_memory(f"Starting lgb.train with max_bin={params.get('max_bin')}...")
     booster = lgb.train(
-        params,
-        train_data,
-        num_boost_round=num_boost_round,
-        valid_sets=[val_data],
-        valid_names=["eval"],
-        callbacks=callbacks,
+        params, train_data, num_boost_round=num_boost_round,
+        valid_sets=[val_data], valid_names=['eval'], callbacks=callbacks
     )
-    log_memory("lgb.train has finished successfully.")
+    log_memory("Model training finished successfully.")
 
-    log_memory("Evaluating model on the test set...")
+    log_memory("Evaluating model...")
     pred_probs = booster.predict(X_te)
-    preds = (pred_probs > 0.5).astype(int)
 
+    if num_classes > 2:
+        preds = np.argmax(pred_probs, axis=1)
+    else:
+        preds = (pred_probs > 0.5).astype(int)
+
+    target_names = [ID_TO_LABEL[i] for i in sorted(ID_TO_LABEL.keys())]
     report = classification_report(
-        y_te, preds, target_names=[ID_TO_LABEL[0], ID_TO_LABEL[1]], digits=4
-    )
+        y_te, preds, target_names=target_names, digits=4)
     print("\n--- Final Classification Report ---\n")
     print(report)
-    (REPORTS_DIR / "lgbm_final_classification_report.txt").write_text(report)
+    (REPORTS_DIR / "classification_report.txt").write_text(report)
     log_memory("Classification report saved.")
 
     _save_incorrect_predictions(
-        y_true=y_te,
-        y_pred=preds,
-        pred_probs=pred_probs,
-        urls=urls_te,
-        output_path=REPORTS_DIR / "lgbm_incorrect_predictions.csv",
-        id_to_label_map=ID_TO_LABEL,
+        y_true=y_te, y_pred=preds, pred_probs=pred_probs, urls=urls_te,
+        output_path=REPORTS_DIR / "incorrect_predictions.csv", id_to_label_map=ID_TO_LABEL
     )
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ConfusionMatrixDisplay.from_predictions(
-        y_te,
-        preds,
-        display_labels=[ID_TO_LABEL[0], ID_TO_LABEL[1]],
-        cmap="Blues",
-        ax=ax,
-    )
-    ax.set_title("Confusion Matrix – Final Model")
+        y_te, preds, display_labels=target_names, cmap="Blues", ax=ax)
+    ax.set_title("Confusion Matrix")
     plt.tight_layout()
-    plt.savefig(REPORTS_DIR / "lgbm_final_confusion_matrix.png")
+    plt.savefig(REPORTS_DIR / "confusion_matrix.png")
     plt.close(fig)
-    log_memory("Confusion-matrix plot saved.")
+    log_memory("Confusion matrix plot saved.")
 
     artifact = {"vectorizer": vectorizer, "model": booster}
-    joblib.dump(artifact, MODELS_DIR / "ayush.joblib")
-    log_memory("Model artifacts (vectorizer + booster) saved. ✅")
+    model_path = MODELS_DIR / "ayush.joblib"
+    joblib.dump(artifact, model_path, compress=3)
+    log_memory(f"Final model artifact saved to '{model_path}'. ✅")
     log_memory("--- Pipeline End ---")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Train the main BlogSpy model.")
-    ap.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Train the main BlogSpy model.")
+    parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Force rebuilding the feature matrix cache",
+        help="Force rebuilding the feature matrix from scratch, ignoring any cache."
     )
-    args = ap.parse_args()
+    args = parser.parse_args()
     main(rebuild=args.rebuild)
