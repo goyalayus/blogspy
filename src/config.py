@@ -22,32 +22,32 @@ ID_TO_LABEL = {v: k for k, v in LABEL_MAPPING.items()}
 
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-HASH_DIM = 2**18
-MEM_LIMIT_GB = 16
+HASH_DIM = 2**16
+MEM_LIMIT_GB = 28
 
 LGBM_PARAMS = {
     "objective":        "binary",
     "boosting_type":    "gbdt",
     "metric":           "binary_logloss",
-    
-    "n_estimators":     3000, 
-    
-    "learning_rate":    0.02, 
-    
-    "num_leaves":       127, 
-    
-    "max_bin":          255, 
-    
-    "feature_fraction": 0.8,    
-    "bagging_fraction": 0.8,   
+
+    "n_estimators":     3000,
+
+    "learning_rate":    0.02,
+
+    "num_leaves":       31,
+
+    "max_bin":          63,
+
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
     "bagging_freq":     1,
     "lambda_l1":        0.1,
     "lambda_l2":        0.1,
-    
-    "min_child_samples": 15,    
-    
-    "n_jobs":           -1,
-    "verbosity":        -1,
+
+    "min_child_samples": 15,
+
+    "n_jobs": -1,
+    "verbosity": -1,
     "seed":             RANDOM_STATE,
 }
 
