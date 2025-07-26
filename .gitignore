@@ -16,7 +16,6 @@ venv/
 .vscode/
 data/processed/temp_enriched_data.jsonl
 
-outputs/
 # Ignore everything in data/
 data/*
 

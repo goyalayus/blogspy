@@ -160,7 +160,7 @@ def build_features_from_scratch() -> tuple[sp.csr_matrix, np.ndarray, np.ndarray
     num_chunks = pf.num_row_groups
     del pf
 
-    num_workers = max(1, multiprocessing.cpu_count() - 1)
+    num_workers = 8
     log_memory(
         f"Distributing {num_chunks} chunks across {num_workers} worker processes...")
 
