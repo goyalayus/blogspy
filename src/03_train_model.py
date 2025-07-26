@@ -1,16 +1,15 @@
 """
 BlogSpy – fault-tolerant, memory-safe, and parallelized training pipeline
 
-[FINAL VERSION]
+[FINAL VERSION - WITH DETAILED DIAGNOSTIC LOGGING]
 This script performs the full model training pipeline and is optimized for
 multi-core machines.
 
 1.  Loads or builds a feature matrix from the enriched Parquet data.
     - If --rebuild is used, it now uses a parallel multiprocessing approach
-      to build features significantly faster, leveraging all available CPUs.
-    - Caches the expensive-to-build feature matrix to disk for rapid re-runs.
-2.  Implements aggressive memory management to prevent out-of-memory errors
-    during model training, even on large datasets.
+      and provides DETAILED real-time logs on memory usage per worker,
+      accumulator size, and swap usage.
+2.  Implements aggressive memory management to prevent out-of-memory errors.
 3.  Trains a LightGBM model, evaluates its performance, and saves the final
     model artifact (containing both the trained model and its vectorizer).
 4.  Adds error analysis by saving incorrectly classified test set URLs
@@ -30,6 +29,7 @@ from src.config import (ENRICHED_DATA_FILE, HASH_DIM, ID_TO_LABEL, LGBM_PARAMS,
 import argparse
 import gc
 import multiprocessing
+import os
 import pathlib
 import resource
 import sys
@@ -72,13 +72,17 @@ VECTORIZER_NGRAM_RANGE = (1, 2)
 
 
 def log_memory(msg: str):
-    """Logs a message with the current process memory usage."""
-    mem_gb = psutil.Process().memory_info().rss / 1e9
-    logger.info(f"{f'[{mem_gb:.2f} GB]':<10} {msg}")
+    """
+    [LOGGING ENHANCEMENT] Logs a message with current process memory
+    AND system-wide swap usage.
+    """
+    process_mem_gb = psutil.Process().memory_info().rss / 1e9
+    swap = psutil.swap_memory()
+    swap_str = f"SWAP: {swap.used / 1e9:.2f}/{swap.total / 1e9:.2f} GB"
+    logger.info(f"{f'[{process_mem_gb:.2f} GB]':<10} {swap_str:<25} {msg}")
 
 
 def _set_memory_cap(gb: int | None) -> None:
-    """Sets a soft memory limit for the process (Linux/macOS only)."""
     if gb is None or sys.platform == "win32":
         return
     try:
@@ -89,7 +93,7 @@ def _set_memory_cap(gb: int | None) -> None:
         logger.warning(f"Could not set memory cap: {e}")
 
 
-# ───────────────── Feature Engineering (Parallelized) ──────────────────────
+# ───────────────── Feature Engineering (Parallelized with Logging) ─────────
 
 def _vectorize_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
     """Vectorizes a single DataFrame chunk into a sparse feature matrix."""
@@ -100,20 +104,20 @@ def _vectorize_chunk(df: pd.DataFrame, hv: HashingVectorizer) -> sp.csr_matrix:
     content_features = extract_content_features(
         df["text_content"]).to_numpy(dtype="float32")
     return sp.hstack([
-        text_features,
-        sp.csr_matrix(url_features),
-        sp.csr_matrix(structural_features),
-        sp.csr_matrix(content_features)
+        text_features, sp.csr_matrix(url_features),
+        sp.csr_matrix(structural_features), sp.csr_matrix(content_features)
     ], format="csr")
 
 
-def _process_chunk_worker(chunk_index: int) -> tuple[sp.csr_matrix | None, np.ndarray | None, np.ndarray | None]:
+def _process_chunk_worker(chunk_index: int) -> tuple[sp.csr_matrix | None, np.ndarray | None, np.ndarray | None, float]:
     """
-    Worker function executed by each parallel process.
-    It reads and processes a single data chunk.
+    [LOGGING ENHANCEMENT] Worker function executed by each parallel process.
+    It now logs its own status and memory usage.
     """
-    # NOTE: The HashingVectorizer and ParquetFile handle are created here
-    # to be local to each process, avoiding serialization errors.
+    pid = os.getpid()
+    process_name = f"PID[{pid}]"
+    logger.info(f"{process_name:<10} START: Processing chunk {chunk_index}")
+
     hv = HashingVectorizer(
         stop_words="english", n_features=HASH_DIM,
         ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
@@ -126,19 +130,29 @@ def _process_chunk_worker(chunk_index: int) -> tuple[sp.csr_matrix | None, np.nd
         chunk_index, columns=required_cols).to_pandas().dropna(subset=["url", "label"])
 
     if df_chunk.empty:
-        return None, None, None
+        logger.warning(
+            f"{process_name:<10} SKIP: Chunk {chunk_index} was empty.")
+        return None, None, None, 0.0
 
     X_chunk = _vectorize_chunk(df_chunk, hv)
     y_chunk = df_chunk["label"].to_numpy(dtype="int8")
     urls_chunk = df_chunk["url"].to_numpy(dtype=object)
 
-    return X_chunk, y_chunk, urls_chunk
+    # [LOGGING ENHANCEMENT] Calculate and log memory usage for this specific worker/chunk
+    worker_mem_mb = psutil.Process(pid).memory_info().rss / 1e6
+    result_size_mb = (X_chunk.data.nbytes +
+                      y_chunk.nbytes + urls_chunk.nbytes) / 1e6
+    logger.info(
+        f"{process_name:<10} DONE:  Chunk {chunk_index}. Worker Mem: {worker_mem_mb: >5.0f} MB. Result Size: {result_size_mb:.2f} MB"
+    )
+
+    return X_chunk, y_chunk, urls_chunk, result_size_mb
 
 
 def build_features_from_scratch() -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, HashingVectorizer]:
     """
-    Builds the complete feature matrix in parallel using multiprocessing
-    to leverage all available CPU cores.
+    [LOGGING ENHANCEMENT] Builds the complete feature matrix in parallel and now
+    includes detailed logging of the accumulator size in the main process.
     """
     log_memory("Starting PARALLEL feature building from scratch...")
 
@@ -150,16 +164,31 @@ def build_features_from_scratch() -> tuple[sp.csr_matrix, np.ndarray, np.ndarray
     log_memory(
         f"Distributing {num_chunks} chunks across {num_workers} worker processes...")
 
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        # Use pool.imap to preserve the order of results, which is critical.
-        results = list(tqdm(
-            pool.imap(_process_chunk_worker, range(num_chunks)),
-            total=num_chunks,
-            desc="Processing Chunks (Parallel)"
-        ))
+    results = []
+    total_results_size_mb = 0.0
+    log_interval = 20  # How often to log the main process status
 
+    with multiprocessing.Pool(processes=num_workers) as pool, \
+            tqdm(total=num_chunks, desc="Processing Chunks (Parallel)") as pbar:
+
+        # [LOGGING ENHANCEMENT] Unrolling the list comprehension into a for loop
+        # to allow for periodic logging inside the main process.
+        for i, result_chunk in enumerate(pool.imap(_process_chunk_worker, range(num_chunks))):
+            if result_chunk[0] is not None:
+                results.append(result_chunk)
+                # Add the size of the returned result
+                total_results_size_mb += result_chunk[3]
+            pbar.update(1)
+
+            # [LOGGING ENHANCEMENT] Log main process status periodically
+            if (i + 1) % log_interval == 0 or (i + 1) == num_chunks:
+                msg = (f"MAIN PROCESS holding {len(results)} results. "
+                       f"Accumulated Result Size: {total_results_size_mb / 1024:.2f} GB")
+                log_memory(msg)
+
+    # Filter out empty results one last time (though handled in loop)
     results = [res for res in results if res[0] is not None]
-    X_parts, y_parts, url_parts = zip(*results)
+    X_parts, y_parts, url_parts, _ = zip(*results)
 
     log_memory("Finished processing all chunks. Now stacking results...")
     X = sp.vstack(X_parts, format="csr")
@@ -174,7 +203,6 @@ def build_features_from_scratch() -> tuple[sp.csr_matrix, np.ndarray, np.ndarray
     np.save(URLS_FILE, urls)
     log_memory(f"Feature cache written to disk at '{PROCESSED_DATA_DIR}'.")
 
-    # Return a final vectorizer instance for the main function to use
     final_hv = HashingVectorizer(
         stop_words="english", n_features=HASH_DIM,
         ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
@@ -188,6 +216,10 @@ def load_or_build_features(rebuild: bool) -> tuple[sp.csr_matrix, np.ndarray, np
     Loads features from cache if available. Otherwise, builds them from scratch
     using a parallelized process.
     """
+    # NOTE: This logic for inferring n_features is slightly brittle. If you add
+    # more non-text features, the '- 12' will need to be updated.
+    num_non_text_features = 12
+
     if (not rebuild) and FEATURES_FILE.exists() and LABELS_FILE.exists() and URLS_FILE.exists():
         log_memory(
             "Found cached features, labels, and URLs. Loading from disk...")
@@ -196,10 +228,11 @@ def load_or_build_features(rebuild: bool) -> tuple[sp.csr_matrix, np.ndarray, np
         urls = np.load(URLS_FILE, allow_pickle=True)
         log_memory(
             f"Loaded X{X.shape}, y{y.shape}, urls{urls.shape} from cache.")
-        # Return a vectorizer with matching settings for the loaded data
+
+        # Infer HASH_DIM from the shape of the loaded matrix
+        inferred_hash_dim = X.shape[1] - num_non_text_features
         hv = HashingVectorizer(
-            # Infer from loaded X
-            stop_words="english", n_features=X.shape[1] - 12,
+            stop_words="english", n_features=inferred_hash_dim,
             ngram_range=VECTORIZER_NGRAM_RANGE, alternate_sign=False,
             norm="l2", dtype=np.float32
         )
@@ -212,7 +245,7 @@ def _save_incorrect_predictions(
     y_true: np.ndarray, y_pred: np.ndarray, pred_probs: np.ndarray,
     urls: np.ndarray, output_path: pathlib.Path, id_to_label_map: Dict[int, str]
 ) -> None:
-    """Saves a CSV of misclassified URLs for error analysis."""
+    # This function remains unchanged as its logic is sound.
     incorrect_indices = np.where(y_true != y_pred)[0]
     if len(incorrect_indices) == 0:
         logger.info(
@@ -222,8 +255,7 @@ def _save_incorrect_predictions(
     pred_is_binary_prob = len(pred_probs.shape) == 1
 
     incorrect_data = {
-        "url": urls[incorrect_indices],
-        "true_label": y_true[incorrect_indices],
+        "url": urls[incorrect_indices], "true_label": y_true[incorrect_indices],
         "predicted_label": y_pred[incorrect_indices],
     }
 
@@ -237,8 +269,7 @@ def _save_incorrect_predictions(
         df_incorrect["confidence"] = pred_probs[incorrect_indices]
         df_incorrect["confidence_in_prediction"] = np.where(
             df_incorrect["predicted_label"] == 1,
-            df_incorrect["confidence"],
-            1 - df_incorrect["confidence"],
+            df_incorrect["confidence"], 1 - df_incorrect["confidence"],
         )
 
     cols_to_keep = ["url", "true_label_name",
@@ -254,7 +285,7 @@ def _save_incorrect_predictions(
 # ─────────────────────────── Main Training Pipeline ──────────────────────────
 
 def main(rebuild: bool) -> None:
-    """Main function to run the end-to-end training pipeline."""
+    # This function remains unchanged as its logic is sound.
     log_memory("--- Pipeline Start ---")
     _set_memory_cap(MEM_LIMIT_GB)
 
